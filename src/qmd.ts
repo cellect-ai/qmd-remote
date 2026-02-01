@@ -135,6 +135,7 @@ import {
   removeContext as yamlRemoveContext,
   setGlobalContext,
   listAllContexts,
+  setConfigDirResolver,
 } from "./collections.js";
 
 // Enable production mode - allows using default database path
@@ -2423,6 +2424,9 @@ function parseCLI() {
   if (cliQmdDir) {
     setCliQmdDir(cliQmdDir);
   }
+
+  // Use index-colocated config when using a .qmd directory
+  setConfigDirResolver(() => getEffectiveQmdDir());
 
   // Select index name (default: "index")
   const indexName = values.index as string | undefined;

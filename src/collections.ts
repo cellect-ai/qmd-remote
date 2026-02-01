@@ -1,14 +1,31 @@
 /**
  * Collections configuration management
  *
- * This module manages the YAML-based collection configuration at ~/.config/qmd/index.yml.
- * Collections define which directories to index and their associated contexts.
+ * Collection config is resolved with priority:
+ * 1. {qmdDir}/index.yml when using a .qmd directory (CLI, saved config, or auto-discover)
+ * 2. ~/.config/qmd/index.yml (fallback)
+ *
+ * This keeps config colocated with the index for shared NFS setups.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import YAML from "yaml";
+
+// ============================================================================
+// Config path resolution (avoids circular import with store)
+// ============================================================================
+
+let _qmdDirResolver: (() => string | null) | null = null;
+
+/**
+ * Set the resolver for the effective .qmd directory.
+ * When set, config is loaded from {qmdDir}/index.yml first.
+ */
+export function setConfigDirResolver(resolver: (() => string | null) | null): void {
+  _qmdDirResolver = resolver;
+}
 
 // ============================================================================
 // Types
@@ -50,24 +67,29 @@ export interface NamedCollection extends Collection {
 // Configuration paths
 // ============================================================================
 
-function getConfigDir(): string {
-  // Allow override via QMD_CONFIG_DIR for testing
-  if (process.env.QMD_CONFIG_DIR) {
-    return process.env.QMD_CONFIG_DIR;
-  }
-  return join(homedir(), ".config", "qmd");
-}
-
 function getConfigFilePath(): string {
-  return join(getConfigDir(), "index.yml");
+  // 1. Test override (QMD_CONFIG_DIR)
+  if (process.env.QMD_CONFIG_DIR) {
+    return join(process.env.QMD_CONFIG_DIR, "index.yml");
+  }
+  // 2. Index-colocated config when using a .qmd directory
+  if (_qmdDirResolver) {
+    const qmdDir = _qmdDirResolver();
+    if (qmdDir) {
+      return join(qmdDir, "index.yml");
+    }
+  }
+  // 3. Fallback to global config
+  return join(homedir(), ".config", "qmd", "index.yml");
 }
 
 /**
- * Ensure config directory exists
+ * Ensure config directory exists (for saveConfig)
  */
 function ensureConfigDir(): void {
-  const configDir = getConfigDir();
-  if (!existsSync(configDir)) {
+  const configPath = getConfigFilePath();
+  const configDir = configPath.slice(0, configPath.lastIndexOf("/"));
+  if (configDir && !existsSync(configDir)) {
     mkdirSync(configDir, { recursive: true });
   }
 }
@@ -77,8 +99,8 @@ function ensureConfigDir(): void {
 // ============================================================================
 
 /**
- * Load configuration from ~/.config/qmd/index.yml
- * Returns empty config if file doesn't exist
+ * Load configuration from {qmdDir}/index.yml (when using .qmd dir) or ~/.config/qmd/index.yml.
+ * Returns empty config if file doesn't exist.
  */
 export function loadConfig(): CollectionConfig {
   const configPath = getConfigFilePath();
@@ -102,7 +124,7 @@ export function loadConfig(): CollectionConfig {
 }
 
 /**
- * Save configuration to ~/.config/qmd/index.yml
+ * Save configuration to {qmdDir}/index.yml (when using .qmd dir) or ~/.config/qmd/index.yml.
  */
 export function saveConfig(config: CollectionConfig): void {
   ensureConfigDir();
