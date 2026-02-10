@@ -712,7 +712,16 @@ function initializeDatabase(db: Database): void {
     // sqlite-vec is optional — vector search won't work but FTS is fine
     _sqliteVecAvailable = false;
   }
-  db.exec("PRAGMA journal_mode = WAL");
+  // NFS-friendly SQLite settings:
+  // - DELETE mode instead of WAL (WAL requires shared memory that breaks on NFS)
+  // - NORMAL sync (reduces fsync calls, still crash-safe)
+  // - Large cache to reduce disk reads
+  // - Memory-mapped I/O for faster reads
+  db.exec("PRAGMA journal_mode = DELETE");
+  db.exec("PRAGMA synchronous = NORMAL");
+  db.exec("PRAGMA cache_size = -65536");      // 64MB cache (negative = KB)
+  db.exec("PRAGMA mmap_size = 268435456");    // 256MB memory-mapped I/O
+  db.exec("PRAGMA temp_store = MEMORY");      // Keep temp tables in RAM
   db.exec("PRAGMA foreign_keys = ON");
 
   // Drop legacy tables that are now managed in YAML
@@ -1105,7 +1114,7 @@ export type Store = {
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
   insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
-  findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
+  findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; modified_at: string } | null;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
   updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
   deactivateDocument: (collectionName: string, path: string) => void;
@@ -1897,11 +1906,11 @@ export function findActiveDocument(
   db: Database,
   collectionName: string,
   path: string
-): { id: number; hash: string; title: string } | null {
+): { id: number; hash: string; title: string; modified_at: string } | null {
   const row = db.prepare(`
-    SELECT id, hash, title FROM documents
+    SELECT id, hash, title, modified_at FROM documents
     WHERE collection = ? AND path = ? AND active = 1
-  `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
+  `).get(collectionName, path) as { id: number; hash: string; title: string; modified_at: string } | undefined;
   return row ?? null;
 }
 
