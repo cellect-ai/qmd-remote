@@ -438,10 +438,10 @@ describe("Store Creation", () => {
     await cleanupTestDb(store);
   });
 
-  test("createStore sets WAL journal mode", async () => {
+  test("createStore sets DELETE journal mode (NFS-friendly)", async () => {
     const store = await createTestStore();
     const result = store.db.prepare("PRAGMA journal_mode").get() as { journal_mode: string };
-    expect(result.journal_mode).toBe("wal");
+    expect(result.journal_mode).toBe("delete");
     await cleanupTestDb(store);
   });
 

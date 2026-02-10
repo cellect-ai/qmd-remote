@@ -32,7 +32,7 @@ afterAll(async () => {
 
 function initTestDatabase(db: Database): void {
   sqliteVec.load(db);
-  db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA journal_mode = DELETE");  // NFS-friendly
 
   // Content-addressable storage - the source of truth for document content
   db.exec(`

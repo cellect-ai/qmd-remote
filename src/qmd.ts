@@ -425,7 +425,7 @@ function showStatus(): void {
   closeDb();
 }
 
-async function updateCollections(): Promise<void> {
+async function updateCollections(fullCheck: boolean = false): Promise<void> {
   const db = getDb();
   // Collections are defined in YAML; no duplicate cleanup needed.
 
@@ -480,7 +480,7 @@ async function updateCollections(): Promise<void> {
       }
     }
 
-    await indexFiles(col.pwd, col.glob_pattern, col.name, true);
+    await indexFiles(col.pwd, col.glob_pattern, col.name, true, fullCheck);
     console.log("");
   }
 
@@ -1407,7 +1407,7 @@ function collectionRename(oldName: string, newName: string): void {
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
 }
 
-async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false): Promise<void> {
+async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, fullCheck: boolean = false): Promise<void> {
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
@@ -1451,28 +1451,50 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const seenPaths = new Set<string>();
   const startTime = Date.now();
 
+  // Wrap all inserts/updates in a single transaction for NFS performance
+  // (avoids per-operation fsync with DELETE journal mode)
+  db.exec("BEGIN TRANSACTION");
+
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
     const path = handelize(relativeFile); // Normalize path for token-friendliness
     seenPaths.add(path);
 
-    const content = await Bun.file(filepath).text();
-
-    // Skip empty files - nothing useful to index
-    if (!content.trim()) {
-      processed++;
-      continue;
-    }
-
-    const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
-
-    // Check if document exists in this collection with this path
+    // Check if document exists in this collection with this path FIRST
+    // This allows mtime-based skip without reading the file (huge NFS speedup)
     const existing = findActiveDocument(db, collectionName, path);
 
     if (existing) {
+      // Get file mtime - much faster than reading entire file over NFS
+      const stat = await Bun.file(filepath).stat();
+      const fileMtime = stat ? new Date(stat.mtime).toISOString() : null;
+      const dbMtime = existing.modified_at;
+
+      // If mtime unchanged, skip reading the file entirely (unless --full flag)
+      if (!fullCheck && fileMtime && dbMtime && fileMtime <= dbMtime) {
+        unchanged++;
+        processed++;
+        progress.set((processed / total) * 100);
+        const elapsed = (Date.now() - startTime) / 1000;
+        const rate = processed / elapsed;
+        const remaining = (total - processed) / rate;
+        const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
+        process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
+        continue;
+      }
+
+      // File changed - need to read and hash
+      const content = await Bun.file(filepath).text();
+      if (!content.trim()) {
+        processed++;
+        continue;
+      }
+
+      const hash = await hashContent(content);
+      const title = extractTitle(content, relativeFile);
+
       if (existing.hash === hash) {
-        // Hash unchanged, but check if title needs updating
+        // Content same despite mtime change (touch, copy, etc) - just update mtime
         if (existing.title !== title) {
           updateDocumentTitle(db, existing.id, title, now);
           updated++;
@@ -1480,18 +1502,25 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
           unchanged++;
         }
       } else {
-        // Content changed - insert new content hash and update document
+        // Content actually changed
         insertContent(db, hash, content, now);
-        const stat = await Bun.file(filepath).stat();
-        updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
+        updateDocument(db, existing.id, title, hash, fileMtime || now);
         updated++;
       }
     } else {
-      // New document - insert content and document
+      // New document - must read file
+      const content = await Bun.file(filepath).text();
+      if (!content.trim()) {
+        processed++;
+        continue;
+      }
+
+      const hash = await hashContent(content);
+      const title = extractTitle(content, relativeFile);
+      const stat = await Bun.file(filepath).stat();
+
       indexed++;
       insertContent(db, hash, content, now);
-      const stat = await Bun.file(filepath).stat();
       insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
@@ -1518,6 +1547,9 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   // Clean up orphaned content hashes (content not referenced by any document)
   const orphanedContent = cleanupOrphanedContent(db);
+
+  // Commit the transaction (single fsync for all operations)
+  db.exec("COMMIT");
 
   // Check if vector index needs updating
   const needsEmbedding = getHashesNeedingEmbedding(db);
@@ -2710,7 +2742,7 @@ if (import.meta.main) {
       break;
 
     case "update":
-      await updateCollections();
+      await updateCollections(!!cli.values.full);
       break;
 
     case "embed":
