@@ -49,12 +49,33 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  * Qwen3-Embedding encodes documents as raw text without special prefixes.
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
+  // Clean markdown artifacts that cause poor tokenization
+  const cleaned = text
+    .replace(/\\_+/g, '')                           // Remove escaped underscores
+    .replace(/\|[-:]+\|/g, '')                       // Remove table separators
+    .replace(/<br\s*\/?>/g, ' ')                     // Remove <br> tags
+    .split('\n').map(line => {
+      if (line.includes('|')) {
+        // Extract content from tables, skip line numbers
+        return line.split('|')
+          .map(c => c.trim())
+          .filter(c => c && !/^\d+$/.test(c))
+          .join(' ');
+      }
+      return line;
+    }).join('\n')
+    .replace(/\s+/g, ' ')                            // Collapse whitespace
+    .trim();
+
+  // Truncate title to prevent token overflow (some docs have massive titles)
+  const truncatedTitle = title && title.length > 150 ? title.slice(0, 150) + "..." : (title || "none");
+
   const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
-    return title ? `${title}\n${text}` : text;
+    return title ? `${truncatedTitle}\n${cleaned}` : cleaned;
   }
-  return `title: ${title || "none"} | text: ${text}`;
+  return `title: ${truncatedTitle} | text: ${cleaned}`;
 }
 
 // =============================================================================
