@@ -25,6 +25,7 @@ import {
   getHashesForEmbedding,
   clearAllEmbeddings,
   insertEmbedding,
+  deleteEmbedding,
   getStatus,
   hashContent,
   extractTitle,
@@ -222,6 +223,20 @@ const progress = {
 };
 
 // Format seconds into human-readable ETA
+/** Race a promise against a timeout. Rejects with a descriptive error on timeout. */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timeout after ${ms}ms: ${label}`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
+/** Timeout in ms for individual file I/O operations (stat/read) on potentially slow mounts like NFS. */
+const FILE_IO_TIMEOUT = 10_000;
+
 function formatETA(seconds: number): string {
   if (seconds < 60) return `${Math.round(seconds)}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
@@ -1451,8 +1466,8 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const seenPaths = new Set<string>();
   const startTime = Date.now();
 
-  // Wrap all inserts/updates in a single transaction for NFS performance
-  // (avoids per-operation fsync with DELETE journal mode)
+  // Wrap all inserts/updates in a single transaction for performance
+  // (batches writes into a single WAL checkpoint)
   db.exec("BEGIN TRANSACTION");
 
   for (const relativeFile of files) {
@@ -1464,9 +1479,11 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     // This allows mtime-based skip without reading the file (huge NFS speedup)
     const existing = findActiveDocument(db, collectionName, path);
 
+    try {
+
     if (existing) {
       // Get file mtime - much faster than reading entire file over NFS
-      const stat = await Bun.file(filepath).stat();
+      const stat = await withTimeout(Bun.file(filepath).stat(), FILE_IO_TIMEOUT, `stat ${relativeFile}`);
       const fileMtime = stat ? new Date(stat.mtime).toISOString() : null;
       const dbMtime = existing.modified_at;
 
@@ -1484,7 +1501,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       }
 
       // File changed - need to read and hash
-      const content = await Bun.file(filepath).text();
+      const content = await withTimeout(Bun.file(filepath).text(), FILE_IO_TIMEOUT, `read ${relativeFile}`);
       if (!content.trim()) {
         processed++;
         continue;
@@ -1509,7 +1526,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       }
     } else {
       // New document - must read file
-      const content = await Bun.file(filepath).text();
+      const content = await withTimeout(Bun.file(filepath).text(), FILE_IO_TIMEOUT, `read ${relativeFile}`);
       if (!content.trim()) {
         processed++;
         continue;
@@ -1517,7 +1534,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
       const hash = await hashContent(content);
       const title = extractTitle(content, relativeFile);
-      const stat = await Bun.file(filepath).stat();
+      const stat = await withTimeout(Bun.file(filepath).stat(), FILE_IO_TIMEOUT, `stat ${relativeFile}`);
 
       indexed++;
       insertContent(db, hash, content, now);
@@ -1533,6 +1550,13 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const remaining = (total - processed) / rate;
     const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
     process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
+
+    } catch (err: any) {
+      // Skip files that timeout or fail to read (e.g. stale NFS handles)
+      process.stderr.write(`\n${c.yellow}Skipping ${relativeFile}: ${err.message}${c.reset}\n`);
+      processed++;
+      continue;
+    }
   }
 
   // Deactivate documents in this collection that no longer exist
@@ -1617,9 +1641,9 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     let chunks: { text: string; pos: number; tokens: number }[];
     if (useRemote) {
       // Character-based chunking for remote mode
-      // Use smaller chunks (2000 chars ~500 tokens) to fit in remote server slots
-      const REMOTE_CHUNK_CHARS = 2000;
-      const REMOTE_OVERLAP_CHARS = 300;
+      // 800 chars with 4096 token batch size handles heavy markdown formatting
+      const REMOTE_CHUNK_CHARS = 800;
+      const REMOTE_OVERLAP_CHARS = 120;
       const charChunks = chunkDocument(item.body, REMOTE_CHUNK_CHARS, REMOTE_OVERLAP_CHARS);
       chunks = charChunks.map(c => ({
         text: c.text,
@@ -1722,21 +1746,33 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
         }
       } catch (err) {
         // If batch fails, try individual embeddings as fallback
-        for (const chunk of batch) {
-          try {
-            const text = formatDocForEmbedding(chunk.text, chunk.title);
-            const result = await session.embed(text);
-            if (result) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
-              chunksEmbedded++;
-            } else {
+        // Note: sqlite-vec virtual tables may not properly rollback in transactions,
+        // so we delete before inserting to avoid UNIQUE constraint errors
+        // Wrap in transaction to reduce lock contention (instead of 64 transactions, just 1)
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          for (const chunk of batch) {
+            try {
+              const text = formatDocForEmbedding(chunk.text, chunk.title);
+              const result = await session.embed(text);
+              if (result) {
+                // Delete first to handle cases where virtual table didn't rollback
+                deleteEmbedding(db, chunk.hash, chunk.seq);
+                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+                chunksEmbedded++;
+              } else {
+                errors++;
+              }
+            } catch (innerErr) {
               errors++;
+              console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}: ${innerErr}${c.reset}`);
             }
-          } catch (innerErr) {
-            errors++;
-            console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}: ${innerErr}${c.reset}`);
+            bytesProcessed += chunk.bytes;
           }
-          bytesProcessed += chunk.bytes;
+          db.exec("COMMIT");
+        } catch (txErr) {
+          db.exec("ROLLBACK");
+          throw txErr;
         }
       }
 

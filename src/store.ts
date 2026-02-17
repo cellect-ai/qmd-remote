@@ -568,13 +568,11 @@ function initializeDatabase(db: Database): void {
     }
     throw err;
   }
-  // NFS-friendly SQLite settings:
-  // - DELETE mode instead of WAL (WAL requires shared memory that breaks on NFS)
-  // - NORMAL sync (reduces fsync calls, still crash-safe)
-  // - Large cache to reduce disk reads
-  // - Memory-mapped I/O for faster reads
-  db.exec("PRAGMA journal_mode = DELETE");
+  // WAL mode for local-disk performance (concurrent reads + writes)
+  // NORMAL sync is safe with WAL (WAL protects against corruption on crash)
+  db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA synchronous = NORMAL");
+  db.exec("PRAGMA busy_timeout = 30000");     // Wait up to 30s for locks (embedding is I/O bound)
   db.exec("PRAGMA cache_size = -65536");      // 64MB cache (negative = KB)
   db.exec("PRAGMA mmap_size = 268435456");    // 256MB memory-mapped I/O
   db.exec("PRAGMA temp_store = MEMORY");      // Keep temp tables in RAM
@@ -2155,6 +2153,17 @@ export function clearAllEmbeddings(db: Database): void {
  * Insert a single embedding into both content_vectors and vectors_vec tables.
  * The hash_seq key is formatted as "hash_seq" for the vectors_vec table.
  */
+/**
+ * Delete a single embedding from both vectors_vec and content_vectors.
+ * Used to clean up before re-inserting to avoid UNIQUE constraint errors
+ * with sqlite-vec virtual tables that may not properly support INSERT OR REPLACE.
+ */
+export function deleteEmbedding(db: Database, hash: string, seq: number): void {
+  const hashSeq = `${hash}_${seq}`;
+  db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`).run(hashSeq);
+  db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND seq = ?`).run(hash, seq);
+}
+
 export function insertEmbedding(
   db: Database,
   hash: string,

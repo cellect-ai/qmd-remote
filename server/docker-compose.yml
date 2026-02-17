@@ -12,7 +12,7 @@ services:
       -m /models/embeddinggemma-300M-Q8_0.gguf
       --embedding --pooling mean
       --host 0.0.0.0 --port 8080
-      -ngl 99 -b 2048 -ub 2048 -np 8 -c 16384
+      -ngl 99 -b 4096 -ub 4096 -np 4 -c 16384
     deploy:
       resources:
         reservations:
