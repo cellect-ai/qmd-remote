@@ -1487,6 +1487,12 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       const fileMtime = stat ? new Date(stat.mtime).toISOString() : null;
       const dbMtime = existing.modified_at;
 
+      // Skip empty files without reading content
+      if (stat && stat.size === 0) {
+        processed++;
+        continue;
+      }
+
       // If mtime unchanged, skip reading the file entirely (unless --full flag)
       if (!fullCheck && fileMtime && dbMtime && fileMtime <= dbMtime) {
         unchanged++;
@@ -1525,7 +1531,12 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
         updated++;
       }
     } else {
-      // New document - must read file
+      // New document - stat first to skip empty files without reading
+      const newStat = await withTimeout(Bun.file(filepath).stat(), FILE_IO_TIMEOUT, `stat ${relativeFile}`);
+      if (newStat && newStat.size === 0) {
+        processed++;
+        continue;
+      }
       const content = await withTimeout(Bun.file(filepath).text(), FILE_IO_TIMEOUT, `read ${relativeFile}`);
       if (!content.trim()) {
         processed++;
@@ -1592,7 +1603,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 }
 
 function renderProgressBar(percent: number, width: number = 30): string {
-  const filled = Math.round((percent / 100) * width);
+  const filled = Math.min(Math.round((percent / 100) * width), width);
   const empty = width - filled;
   const bar = "█".repeat(filled) + "░".repeat(empty);
   return bar;
