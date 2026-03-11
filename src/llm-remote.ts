@@ -195,7 +195,7 @@ export class RemoteLLM implements LLM {
   }
 
   /**
-   * Get embeddings via remote server
+   * Get embeddings via remote server (retries up to 3 times on transient errors)
    */
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     if (!this.embedUrl) {
@@ -203,43 +203,62 @@ export class RemoteLLM implements LLM {
       return null;
     }
 
-    try {
-      const response = await fetch(`${this.embedUrl}/v1/embeddings`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          input: text,
-          model: "embeddinggemma",
-        }),
-      });
+    const MAX_RETRIES = 3;
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        const response = await fetch(`${this.embedUrl}/v1/embeddings`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            input: text,
+            model: "embeddinggemma",
+          }),
+        });
 
-      if (!response.ok) {
-        console.error(`Embed request failed: ${response.status} ${response.statusText}`);
+        if (response.status === 400) {
+          // Client error — retrying won't help
+          console.error(`Embed request failed: ${response.status} ${response.statusText}`);
+          return null;
+        }
+
+        if (!response.ok) {
+          console.error(`Embed request failed: ${response.status} ${response.statusText}`);
+          if (attempt < MAX_RETRIES - 1) {
+            await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+            continue;
+          }
+          return null;
+        }
+
+        const data = await response.json() as {
+          data: Array<{ embedding: number[] }>;
+          model: string;
+        };
+
+        if (!data.data || data.data.length === 0) {
+          console.error("No embedding data in response");
+          return null;
+        }
+
+        return {
+          embedding: data.data[0]!.embedding,
+          model: data.model || "remote-embed",
+        };
+      } catch (error) {
+        if (attempt < MAX_RETRIES - 1) {
+          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+          continue;
+        }
+        console.error("Embedding error:", error);
         return null;
       }
-
-      const data = await response.json() as {
-        data: Array<{ embedding: number[] }>;
-        model: string;
-      };
-
-      if (!data.data || data.data.length === 0) {
-        console.error("No embedding data in response");
-        return null;
-      }
-
-      return {
-        embedding: data.data[0]!.embedding,
-        model: data.model || "remote-embed",
-      };
-    } catch (error) {
-      console.error("Embedding error:", error);
-      return null;
     }
+    return null;
   }
 
   /**
-   * Batch embed multiple texts in a single API call
+   * Batch embed multiple texts in a single API call.
+   * On batch failure, falls back to sequential individual requests (which have their own retries).
    */
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
     if (texts.length === 0) return [];
@@ -260,7 +279,7 @@ export class RemoteLLM implements LLM {
 
       if (!response.ok) {
         console.error(`Batch embed failed: ${response.status} ${response.statusText}`);
-        // Fall back to sequential individual requests (avoids DB locking)
+        // Fall back to sequential individual requests (each has retries)
         const results: (EmbeddingResult | null)[] = [];
         for (const text of texts) {
           results.push(await this.embed(text));
@@ -291,7 +310,7 @@ export class RemoteLLM implements LLM {
       return results;
     } catch (error) {
       console.error("Batch embedding error:", error);
-      // Fall back to sequential individual requests (avoids DB locking)
+      // Fall back to sequential individual requests (each has retries)
       const results: (EmbeddingResult | null)[] = [];
       for (const text of texts) {
         results.push(await this.embed(text));
