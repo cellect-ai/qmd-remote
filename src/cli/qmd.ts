@@ -103,14 +103,12 @@ import {
 import {
   getCollection as getCollectionFromYaml,
   listCollections as yamlListCollections,
-  getDefaultCollectionNames,
   addContext as yamlAddContext,
   removeContext as yamlRemoveContext,
   removeCollection as yamlRemoveCollectionFn,
   renameCollection as yamlRenameCollectionFn,
   setGlobalContext,
   listAllContexts,
-  setConfigIndexName,
   loadConfig,
   setConfigDirResolver,
 } from "../collections.js";
@@ -2059,7 +2057,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
 function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults: boolean = false): string[] {
   // If no filter specified and useDefaults is true, use default collections
   if (!raw && useDefaults) {
-    return getDefaultCollectionNames();
+    return yamlListCollections().map(c => c.name);
   }
   if (!raw) return [];
   const names = Array.isArray(raw) ? raw : [raw];
@@ -2478,7 +2476,6 @@ function parseCLI() {
   const indexName = values.index as string | undefined;
   if (indexName) {
     setIndexName(indexName);
-    setConfigIndexName(indexName);
   }
 
   // Determine output format
