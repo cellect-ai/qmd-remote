@@ -4,6 +4,7 @@
 
 ### Added
 
+<<<<<<< HEAD
 - Added Oxlint lint fence.
 - Document metadata and metadata filtering. Markdown documents can opt into typed metadata through a namespaced frontmatter block (`qmd.metadata` with strings, numbers, booleans, or flat homogeneous arrays), and every search surface — CLI `search`/`vsearch`/`query` via `--filter <json>`, the SDK's `filter` option on `search()`/`searchLex()`/`searchVector()`, the MCP `query` tool, and HTTP `POST /query` and `/search` — accepts one shared recursive filter AST discriminated by `operator`: `and`/`or`/`not` logical groups, `eq`/`ne`/`gt`/`gte`/`lt`/`lte` comparisons, `in`/`nin`/`all` membership, and `exists` presence. Every returned result satisfies the filter (applied before RRF fusion and reranking); like collection filtering, highly selective filters remain best-effort for top-K completeness. Frontmatter stays ordinary searchable content — no chunking, embedding, snippet, or line-number changes — and documents without `qmd.metadata` behave exactly as before. JSON/SDK/MCP/HTTP results now include each document's indexed metadata, and `qmd status` reports how many documents still need metadata extraction (a normal `qmd update` backfills existing indexes).
 
@@ -539,6 +540,16 @@
   `md` | `xml` | `files`) for `search`, `query`, and `multi-get`. The legacy
   boolean aliases (`--json`/`--csv`/`--md`/`--xml`/`--files`) still work but are
   no longer in `--help`; prefer `--format`.
+=======
+- Add an authenticated `/scoped-query` endpoint and fail-closed Qdrant payload
+  filters for tenant, authorization scope, and access class.
+- Support an ACL manifest during Qdrant imports so private application document
+  IDs and authorization payloads are attached to every indexed point.
+- Add an optional Qdrant-backed lexical, vector, and hybrid retrieval path with
+  explicit collection security domains and a resumable direct-indexing CLI.
+- Support authenticated remote generation without persisting the runtime API
+  key in the exported LLM configuration.
+>>>>>>> 36779d0 (Add tenant-scoped Qdrant search)
 
 ### Fixes
 
