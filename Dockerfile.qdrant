@@ -33,7 +33,7 @@ USER 1000:1000
 ENV HOME=/home/node
 ENV INDEX_PATH=/home/node/.qmd/index.sqlite
 ENV QMD_CONFIG_DIR=/home/node/.qmd
-# Treat the operator-owned index.yml as global config, not a newly discovered
-# project checkout. Upstream's project-local trust gate otherwise skips all
-# external collection paths while returning a successful update exit status.
+# Keep execution independent of HOME's project discovery. The legacy .qmd
+# config additionally needs a one-time `qmd trust` approval for its exact
+# collection paths; do not globally disable upstream's trust gate.
 WORKDIR /opt/qmd
