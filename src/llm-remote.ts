@@ -233,6 +233,10 @@ export class RemoteLLM implements LLM {
 
   /** Get embeddings via remote server. */
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    return this.embedWithinContext(text, 0);
+  }
+
+  private async embedWithinContext(text: string, depth: number): Promise<EmbeddingResult | null> {
     if (!this.embedUrl) {
       console.error("No embed URL configured");
       return null;
@@ -254,6 +258,27 @@ export class RemoteLLM implements LLM {
         if (!response.ok) {
           const body = await response.text().catch(() => "");
           const preview = body ? ` - ${body.slice(0, 300)}` : "";
+
+          // Character-sized chunks can exceed the model's token budget for
+          // dense OCR/tables. On an explicit context-limit response only,
+          // recursively embed all text and pool the vectors; never truncate
+          // the source or pretend that an unavailable embedding succeeded.
+          if (response.status === 400 && /exceed_context_size_error|larger than the max context size/i.test(body) && depth < 8) {
+            const characters = Array.from(embedText);
+            if (characters.length > 1) {
+              const middle = Math.floor(characters.length / 2);
+              const pieces = [characters.slice(0, middle).join(""), characters.slice(middle).join("")];
+              console.error(`Embedding context limit: pooling two complete segments (depth ${depth + 1})`);
+              const left = await this.embedWithinContext(pieces[0]!, depth + 1);
+              const right = await this.embedWithinContext(pieces[1]!, depth + 1);
+              if (!left || !right || left.model !== right.model || left.embedding.length === 0 || left.embedding.length !== right.embedding.length) return null;
+              const weight = middle / characters.length;
+              const pooled = left.embedding.map((value, index) => value * weight + right.embedding[index]! * (1 - weight));
+              const norm = Math.hypot(...pooled);
+              if (!Number.isFinite(norm) || norm === 0) return null;
+              return { embedding: pooled.map(value => value / norm), model: left.model };
+            }
+          }
 
           if (response.status === 400 && attempt === 0) {
             const sanitized = sanitizeEmbeddingInput(embedText);

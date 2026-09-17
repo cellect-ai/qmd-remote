@@ -34,6 +34,37 @@ describe("RemoteLLM generation authorization", () => {
 });
 
 describe("RemoteLLM embedding sanitization", () => {
+  test("embeds both complete halves on context overflow and normalizes their pooled vector", async () => {
+    const inputs: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+      const input = JSON.parse(String(init?.body)).input as string;
+      inputs.push(input);
+      if (input === "abcd") return Response.json({ error: { type: "exceed_context_size_error" } }, { status: 400 });
+      return Response.json({ data: [{ embedding: input === "ab" ? [1, 0] : [0, 1] }], model: "embeddinggemma" });
+    }));
+    const result = await new RemoteLLM({ embedUrl: "http://embed.test" }).embed("abcd");
+    expect(inputs).toEqual(["abcd", "ab", "cd"]);
+    expect(result?.embedding[0]).toBeCloseTo(Math.SQRT1_2);
+    expect(result?.embedding[1]).toBeCloseTo(Math.SQRT1_2);
+  });
+
+  test("does not split on unrelated server errors or invent a vector", async () => {
+    const request = vi.fn(async () => Response.json({ error: "invalid model" }, { status: 400 }));
+    vi.stubGlobal("fetch", request);
+    expect(await new RemoteLLM({ embedUrl: "http://embed.test" }).embed("abcd")).toBeNull();
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  test("fails closed when either half has no usable vector", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+      const input = JSON.parse(String(init?.body)).input;
+      return input === "abcd"
+        ? Response.json({ error: { type: "exceed_context_size_error" } }, { status: 400 })
+        : Response.json({ data: [{ embedding: [] }], model: "embeddinggemma" });
+    }));
+    expect(await new RemoteLLM({ embedUrl: "http://embed.test" }).embed("abcd")).toBeNull();
+  });
+
   test("replaces unpaired UTF-16 surrogates before sending a batch", async () => {
     let requestBody = "";
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
