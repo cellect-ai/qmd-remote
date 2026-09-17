@@ -730,12 +730,24 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           ?? params.searches[0]?.query ?? "";
         const formatted = results.flatMap(result => {
           if (!result.externalDocumentId) return [];
-          const { line, snippet } = extractSnippet(result.bestChunk, String(primaryQuery), 300);
+          // `bestChunk` begins at zero for each retrieved chunk. Extract from
+          // the hydrated document and pass its selected chunk position so the
+          // returned line (and numbered excerpt) remains addressable in the
+          // source Markdown rather than being chunk-local.
+          const { line, snippet } = extractSnippet(
+            result.body,
+            String(primaryQuery),
+            300,
+            result.bestChunkPos,
+            result.bestChunk.length,
+            params.intent,
+          );
           return [{
             documentId: result.externalDocumentId,
             file: result.displayPath,
             title: result.title,
             score: Math.round(result.score * 100) / 100,
+            line,
             snippet: addLineNumbers(snippet, line),
           }];
         });

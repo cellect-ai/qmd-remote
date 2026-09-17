@@ -15,6 +15,9 @@
 
 ### Fixes
 
+- Return document-global source lines from the authenticated scoped-search
+  endpoint, so a client can open the indexed passage instead of a same-numbered
+  line in a retrieval chunk.
 - Sanitize invalid UTF-16 before remote embedding requests and improve phrase
   and negative-term handling in snippets and Qdrant lexical queries.
 - Pin patched transitive dependency releases used by the service image.
