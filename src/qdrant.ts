@@ -28,6 +28,8 @@ export type QdrantScope = {
 };
 
 export type QdrantDocumentResult = {
+  /** SQLite document identity used only for local metadata post-filtering. */
+  internalDocumentId: number;
   file: string;
   displayPath: string;
   title: string;
@@ -358,6 +360,7 @@ function hydratePoints(
     const displayPath = `${row.collection}/${row.path}`;
     seen.add(documentId);
     results.push({
+      internalDocumentId: row.id,
       file: `qmd://${displayPath}`,
       displayPath,
       title: row.title,

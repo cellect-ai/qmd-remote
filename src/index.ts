@@ -67,7 +67,10 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  type LLM,
 } from "./llm.js";
+import { isQdrantConfigured, type QdrantScope } from "./qdrant.js";
+import { searchQdrantWithMetadata } from "./qdrant-search.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -200,6 +203,8 @@ export interface SearchOptions {
   explain?: boolean;
   /** Chunk strategy: "auto" (default, uses AST for code files) or "regex" (legacy) */
   chunkStrategy?: ChunkStrategy;
+  /** Trusted server-only Qdrant ACL. It is never accepted by public QMD HTTP routes. */
+  qdrantScope?: QdrantScope;
 }
 
 /**
@@ -249,6 +254,8 @@ export interface StoreOptions {
   configPath?: string;
   /** Inline collection config (mutually exclusive with `configPath`) */
   config?: CollectionConfig;
+  /** Optional remote LLM used by a Qdrant-backed deployment. */
+  llm?: LLM;
 }
 
 /**
@@ -414,14 +421,15 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
+  const localLlm = new LlamaCpp({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
-  internal.llm = llm;
+  internal.llm = localLlm;
+  const qdrantLlm = options.llm ?? localLlm;
 
   const store: QMDStore = {
     internal,
@@ -444,6 +452,26 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       const filter = opts.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
 
       if (opts.queries) {
+        if (isQdrantConfigured()) {
+          if (collections.length === 0) {
+            throw new Error("Qdrant-backed search requires explicit collections");
+          }
+          if (!opts.qdrantScope) {
+            throw new Error("Qdrant-backed search requires a trusted scope assertion");
+          }
+          return searchQdrantWithMetadata(internal.db, {
+            collections,
+            searches: opts.queries,
+            llm: qdrantLlm,
+            limit: opts.limit ?? 10,
+            candidateLimit: opts.candidateLimit ?? 40,
+            minScore: opts.minScore ?? 0,
+            rerank: opts.rerank !== false,
+            intent: opts.intent,
+            scope: opts.qdrantScope,
+            filter,
+          });
+        }
         // Pre-expanded queries — use structuredSearch
         return structuredSearch(internal, opts.queries, {
           collections: collections.length > 0 ? collections : undefined,
@@ -477,9 +505,17 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     },
     searchVector: async (q, opts) => {
       const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
-      return internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, filter);
+      return internal.searchVec(q, localLlm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, filter);
     },
-    expandQuery: async (q) => internal.expandQuery(q),
+    expandQuery: async (q) => {
+      // The private Qdrant sidecar keeps models on the GPU service. Do not
+      // initialise node-llama-cpp locally merely to expand a scoped request.
+      if (isQdrantConfigured() && options.llm) {
+        const expanded = await options.llm.expandQuery(q);
+        return expanded.map(item => ({ type: item.type, query: item.text }));
+      }
+      return internal.expandQuery(q);
+    },
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
       const result = internal.findDocument(pathOrDocid, { includeBody: false });
@@ -593,7 +629,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     // Lifecycle
     close: async () => {
-      await llm.dispose();
+      await localLlm.dispose();
       internal.close();
       if (hasYamlConfig || options.config) {
         setConfigSource(undefined); // Reset config source

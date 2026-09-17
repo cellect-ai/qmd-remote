@@ -32,6 +32,13 @@ import {
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
+import { getDefaultRemoteLLM, isRemoteConfigured } from "../llm-remote.js";
+import {
+  bearerToken as scopedBearerToken,
+  loadScopedSearchConfig,
+  ScopedAuthError,
+  verifyScopedSearchToken,
+} from "../scoped-auth.js";
 
 // =============================================================================
 // Types for structured content
@@ -844,6 +851,7 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
   const store = await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
+    ...(isRemoteConfigured() ? { llm: getDefaultRemoteLLM() } : {}),
   });
   const inflight = createInflightGate();
   // serveStdio dual-speaks 2026-07-28 and 2025-era clients on one connection
@@ -898,6 +906,7 @@ export async function startMcpHttpServer(
   const store = await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
+    ...(isRemoteConfigured() ? { llm: getDefaultRemoteLLM() } : {}),
   });
 
   // Pre-fetch default collection names for REST endpoint
@@ -913,6 +922,7 @@ export async function startMcpHttpServer(
 
   const startTime = Date.now();
   const quiet = options?.quiet ?? false;
+  const scopedSearchConfig = loadScopedSearchConfig();
 
   /** Format timestamp for request logging */
   function ts(): string {
@@ -1011,6 +1021,116 @@ export async function startMcpHttpServer(
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(body);
         log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      // Rooms is the only supported consumer of this private route. Its
+      // short-lived assertion fixes collection and ACL dimensions server-side;
+      // callers may supply a metadata filter only to narrow those results.
+      if (pathname === "/scoped-query" && nodeReq.method === "POST") {
+        if (!scopedSearchConfig) {
+          nodeRes.writeHead(404, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Not found" }));
+          return;
+        }
+        const claims = verifyScopedSearchToken(
+          scopedBearerToken(nodeReq.headers.authorization),
+          scopedSearchConfig,
+        );
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(await collectBody(nodeReq));
+        } catch {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Invalid JSON body" }));
+          return;
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "JSON body must be an object" }));
+          return;
+        }
+        const params = parsed as Record<string, unknown>;
+        const searches = params.searches;
+        const validSearches = searches === undefined || (Array.isArray(searches)
+          && searches.length >= 1 && searches.length <= 10
+          && searches.every((search: unknown) => {
+            if (!search || typeof search !== "object") return false;
+            const item = search as Record<string, unknown>;
+            return (item.type === "lex" || item.type === "vec" || item.type === "hyde")
+              && typeof item.query === "string" && item.query.length >= 1 && item.query.length <= 4096;
+          }));
+        const validQuery = params.query === undefined
+          || (typeof params.query === "string" && params.query.length >= 1 && params.query.length <= 4096);
+        const oneQueryForm = (params.query === undefined) !== (searches === undefined);
+        const validLimit = params.limit === undefined
+          || (Number.isSafeInteger(params.limit) && params.limit >= 1 && params.limit <= 50);
+        const validCandidateLimit = params.candidateLimit === undefined
+          || (Number.isSafeInteger(params.candidateLimit) && params.candidateLimit >= 1 && params.candidateLimit <= 100);
+        const validMinScore = params.minScore === undefined
+          || (typeof params.minScore === "number" && params.minScore >= 0 && params.minScore <= 1);
+        const validIntent = params.intent === undefined
+          || (typeof params.intent === "string" && params.intent.length <= 1000);
+        const validRerank = params.rerank === undefined || typeof params.rerank === "boolean";
+        if (!validSearches || !validQuery || !oneQueryForm || !validLimit || !validCandidateLimit || !validMinScore || !validIntent || !validRerank) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Invalid scoped search parameters" }));
+          return;
+        }
+        if (params.collections !== undefined || params.collection !== undefined || params.qdrantScope !== undefined) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Scoped collections and ACL are server controlled" }));
+          return;
+        }
+        const filterValidation = validateFilterArgument(params.filter);
+        if (filterValidation.error) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: filterValidation.error }));
+          return;
+        }
+        const queries: ExpandedQuery[] = typeof params.query === "string"
+          ? await store.expandQuery(params.query)
+          : (searches as Array<Record<string, unknown>>).map(search => ({
+            type: search.type as "lex" | "vec" | "hyde",
+            query: String(search.query),
+          }));
+        if (queries.length === 0) {
+          nodeRes.writeHead(503, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Query expansion returned no searches" }));
+          return;
+        }
+        const primaryQuery = typeof params.query === "string"
+          ? params.query
+          : queries.find(query => query.type === "lex")?.query ?? queries[0]?.query ?? "";
+        const results = await store.search({
+          queries,
+          collections: scopedSearchConfig.collections,
+          filter: filterValidation.filter,
+          qdrantScope: { tenant: claims.tenant, scopes: claims.scopes, access: claims.access },
+          limit: (params.limit as number | undefined) ?? 10,
+          candidateLimit: params.candidateLimit as number | undefined,
+          minScore: (params.minScore as number | undefined) ?? 0,
+          intent: params.intent as string | undefined,
+          rerank: params.rerank as boolean | undefined,
+        });
+        const formatted = results.flatMap(result => {
+          if (!result.externalDocumentId) return [];
+          const { line, snippet } = extractSnippet(
+            result.body, primaryQuery, 300, result.bestChunkPos, result.bestChunk.length,
+            params.intent as string | undefined,
+          );
+          return [{
+            documentId: result.externalDocumentId,
+            file: result.displayPath,
+            title: result.title,
+            score: Math.round(result.score * 100) / 100,
+            line,
+            snippet: addLineNumbers(snippet, line),
+          }];
+        });
+        nodeRes.writeHead(200, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ results: formatted }));
+        log(`${ts()} POST /scoped-query ${queries.length} queries (${Date.now() - reqStart}ms)`);
         return;
       }
 
@@ -1139,6 +1259,12 @@ export async function startMcpHttpServer(
       nodeRes.writeHead(404);
       nodeRes.end("Not Found");
     } catch (err) {
+      if (err instanceof ScopedAuthError) {
+        nodeRes.writeHead(401, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ error: "Unauthorized" }));
+        log(`${ts()} scoped request rejected (${Date.now() - reqStart}ms)`);
+        return;
+      }
       console.error("HTTP handler error:", err);
       nodeRes.writeHead(500);
       nodeRes.end("Internal Server Error");

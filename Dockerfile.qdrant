@@ -7,7 +7,10 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/qmd
 COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile --production
+# QMD's upstream package prepare hook builds distributable artifacts. This
+# sidecar executes the checked-in TypeScript source directly, so the hook's
+# scripts are intentionally absent from this minimal runtime build.
+RUN bun install --frozen-lockfile --production --ignore-scripts
 
 FROM oven/bun:1.3.13-slim@sha256:7e8ed3961db1cdedf17d516dda87948cfedbd294f53bf16462e5b57ed3fff0f1
 
