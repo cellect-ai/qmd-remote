@@ -24,7 +24,7 @@ WORKDIR /opt/qmd
 COPY --from=dependencies --chown=1000:1000 /opt/qmd/node_modules /opt/qmd/node_modules
 COPY --chown=1000:1000 package.json bun.lock ./
 COPY --chown=1000:1000 src /opt/qmd/src
-RUN printf '#!/bin/sh\nexport HOME=/home/node\nexec /usr/local/bin/bun /opt/qmd/src/cli/qmd.ts "$@"\n' \
+RUN printf '#!/bin/sh\nexport HOME=/home/node\nif [ "$1" = "qdrant-import" ]; then\n  shift\n  exec /usr/local/bin/bun /opt/qmd/src/qdrant-import.ts "$@"\nfi\nexec /usr/local/bin/bun /opt/qmd/src/cli/qmd.ts "$@"\n' \
       > /usr/local/bin/qmd \
   && chmod 0755 /usr/local/bin/qmd \
   && install -d -o 1000 -g 1000 -m 0755 /home/node
