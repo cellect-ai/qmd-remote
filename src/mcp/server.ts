@@ -978,7 +978,14 @@ export async function startMcpHttpServer(
   // Helper to collect request body
   async function collectBody(req: IncomingMessage): Promise<string> {
     const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const configured = Number(process.env.QMD_HTTP_MAX_BODY_BYTES ?? 1048576);
+    const maxBytes = Number.isSafeInteger(configured) && configured > 0 ? configured : 1048576;
+    let bytes = 0;
+    for await (const chunk of req) {
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > maxBytes) throw new Error("Request body exceeds limit");
+      chunks.push(chunk as Buffer);
+    }
     return Buffer.concat(chunks).toString();
   }
 
@@ -1064,9 +1071,9 @@ export async function startMcpHttpServer(
           || (typeof params.query === "string" && params.query.length >= 1 && params.query.length <= 4096);
         const oneQueryForm = (params.query === undefined) !== (searches === undefined);
         const validLimit = params.limit === undefined
-          || (Number.isSafeInteger(params.limit) && params.limit >= 1 && params.limit <= 50);
+          || (typeof params.limit === "number" && Number.isSafeInteger(params.limit) && params.limit >= 1 && params.limit <= 50);
         const validCandidateLimit = params.candidateLimit === undefined
-          || (Number.isSafeInteger(params.candidateLimit) && params.candidateLimit >= 1 && params.candidateLimit <= 100);
+          || (typeof params.candidateLimit === "number" && Number.isSafeInteger(params.candidateLimit) && params.candidateLimit >= 1 && params.candidateLimit <= 100);
         const validMinScore = params.minScore === undefined
           || (typeof params.minScore === "number" && params.minScore >= 0 && params.minScore <= 1);
         const validIntent = params.intent === undefined
@@ -1131,6 +1138,14 @@ export async function startMcpHttpServer(
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(JSON.stringify({ results: formatted }));
         log(`${ts()} POST /scoped-query ${queries.length} queries (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      // A configured private sidecar exposes only authenticated scoped search
+      // and health, never generic MCP/get/query routes over the same index.
+      if (scopedSearchConfig) {
+        nodeRes.writeHead(404, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ error: "Not found" }));
         return;
       }
 

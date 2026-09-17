@@ -15,6 +15,7 @@ export type QdrantSearchOptions = {
   candidateLimit?: number;
   llm: LLM;
   scope?: QdrantScope;
+  documentIds?: string[];
   hooks?: {
     onEmbedStart?: (count: number) => void;
     onEmbedDone?: (durationMs: number) => void;
@@ -173,10 +174,12 @@ async function qdrantRequest<T>(config: QdrantConfig, path: string, body: unknow
 export function qdrantSearchFilter(
   collections: string[],
   scope?: QdrantScope,
+  documentIds?: string[],
 ): Record<string, unknown> {
   const must: Record<string, unknown>[] = [
     { key: "source_collection", match: { any: collections } },
   ];
+  if (documentIds !== undefined) must.push({ key: "document_id", match: { any: documentIds } });
   if (scope) {
     if (!scope.tenant || scope.scopes.length === 0 || scope.access.length === 0) {
       throw new Error("Scoped Qdrant search requires tenant, scopes, and access claims");
@@ -290,8 +293,9 @@ async function queryDomain(
   collections: string[],
   limit: number,
   scope?: QdrantScope,
+  documentIds?: string[],
 ): Promise<QdrantPoint[]> {
-  const filter = qdrantSearchFilter(collections, scope);
+  const filter = qdrantSearchFilter(collections, scope, documentIds);
   // Grouping happens after prefetch, so fetch more chunks than the requested
   // number of document groups. Strict mode caps every query stage at 100.
   const prefetchLimit = Math.min(100, Math.max(40, limit * 2));
@@ -334,7 +338,7 @@ function hydratePoints(
       hash: string;
       body: string;
     } | null | undefined;
-    if (!row || row.collection !== point.payload?.source_collection) continue;
+    if (!row || row.collection !== point.payload?.source_collection || row.hash !== point.payload?.hash) continue;
     if (excludedTerms.length > 0) {
       const searchable = `${row.title}\n${row.body}`.toLowerCase();
       if (excludedTerms.some(term => searchable.includes(term))) continue;
@@ -428,6 +432,7 @@ export async function searchQdrant(
         grouped[domain],
         candidateLimit,
         options.scope,
+        options.documentIds,
       )),
   );
 

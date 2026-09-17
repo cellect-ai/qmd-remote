@@ -218,7 +218,7 @@ describe("Qdrant expanded search plans", () => {
       llm,
     });
 
-    expect(expandQuery).toHaveBeenCalledWith("original query", undefined, undefined, llm);
+    expect(expandQuery).toHaveBeenCalledWith("original query");
     expect(embedBatch).toHaveBeenCalled();
     const bodies = fetchMock.mock.calls.map(call => String(call[1]?.body ?? ""));
     if (_name === "hybrid") {

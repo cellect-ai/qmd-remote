@@ -39,6 +39,10 @@ import type {
 } from "./collections.js";
 import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "./metadata.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
+import { isQdrantConfigured } from "./qdrant.js";
+import { searchQdrantWithMetadata } from "./qdrant-search.js";
+import { getDefaultRemoteLLM, isRemoteConfigured } from "./llm-remote.js";
+import type { LLM } from "./llm.js";
 import {
   initializeMetadataSchema,
   syncDocumentMetadata,
@@ -5462,6 +5466,7 @@ export interface SearchHooks {
 }
 
 export interface HybridQueryOptions {
+  llm?: LLM;
   collection?: string | readonly string[];
   filter?: MetadataFilter;  // metadata filter applied to every retrieval call
   limit?: number;           // default 10
@@ -5474,7 +5479,23 @@ export interface HybridQueryOptions {
   hooks?: SearchHooks;
 }
 
+async function qdrantStoreSearch(store: Store, searches: ExpandedQuery[], options: HybridQueryOptions | undefined, llm: LLM): Promise<HybridQueryResult[]> {
+  if (process.env.QMD_SCOPED_TOKEN_SECRET_FILE || process.env.QMD_SCOPED_TOKEN_SECRET) {
+    throw new Error("Private Qdrant indexes require the authenticated scoped endpoint");
+  }
+  const collection = options?.collection;
+  const collections = typeof collection === "string" ? [collection] : [...(collection ?? [])];
+  if (!collections.length) throw new Error("Qdrant search requires explicit collections");
+  return searchQdrantWithMetadata(store.db, {
+    collections, searches, llm, filter: options?.filter,
+    limit: options?.limit ?? 10, candidateLimit: options?.candidateLimit ?? 40,
+    minScore: options?.minScore ?? 0, rerank: options?.skipRerank !== true,
+    intent: options?.intent,
+  });
+}
+
 export interface HybridQueryResult {
+  externalDocumentId?: string;
   file: string;             // internal filepath (qmd://collection/path)
   displayPath: string;
   title: string;
@@ -5540,6 +5561,13 @@ export async function hybridQuery(
   query: string,
   options?: HybridQueryOptions
 ): Promise<HybridQueryResult[]> {
+  if (isQdrantConfigured()) {
+    const llm = options?.llm ?? (isRemoteConfigured() ? getDefaultRemoteLLM() : getLlm(store));
+    const expanded = isRemoteConfigured()
+      ? (await llm.expandQuery(query)).map(item => ({ type: item.type, query: item.text }))
+      : await store.expandQuery(query);
+    return qdrantStoreSearch(store, [{ type: "lex", query }, { type: "vec", query }, ...expanded], options, llm);
+  }
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
@@ -5837,6 +5865,7 @@ export async function hybridQuery(
 }
 
 export interface VectorSearchOptions {
+  llm?: LLM;
   collection?: string | readonly string[];
   filter?: MetadataFilter;  // metadata filter applied to every retrieval call
   limit?: number;           // default 10
@@ -5870,6 +5899,14 @@ export async function vectorSearchQuery(
   query: string,
   options?: VectorSearchOptions
 ): Promise<VectorSearchResult[]> {
+  if (isQdrantConfigured()) {
+    const llm = options?.llm ?? (isRemoteConfigured() ? getDefaultRemoteLLM() : getLlm(store));
+    const expanded = isRemoteConfigured()
+      ? (await llm.expandQuery(query)).map(item => ({ type: item.type, query: item.text }))
+      : await store.expandQuery(query);
+    return qdrantStoreSearch(store, [{ type: "vec", query }, ...expanded.filter(item => item.type !== "lex")],
+      { ...options, skipRerank: true }, llm);
+  }
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
@@ -5925,6 +5962,7 @@ export async function vectorSearchQuery(
  * Matches the format used in QMD training data.
  */
 export interface StructuredSearchOptions {
+  llm?: LLM;
   collections?: string[];   // Filter to specific collections (OR match)
   filter?: MetadataFilter;  // metadata filter applied to every retrieval call
   limit?: number;           // default 10
@@ -5962,6 +6000,10 @@ export async function structuredSearch(
   searches: ExpandedQuery[],
   options?: StructuredSearchOptions
 ): Promise<HybridQueryResult[]> {
+  if (isQdrantConfigured()) {
+    return qdrantStoreSearch(store, searches, { ...options, collection: options?.collections },
+      options?.llm ?? (isRemoteConfigured() ? getDefaultRemoteLLM() : getLlm(store)));
+  }
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;

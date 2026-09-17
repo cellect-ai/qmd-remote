@@ -31,4 +31,9 @@ RUN printf '#!/bin/sh\nexport HOME=/home/node\nif [ "$1" = "qdrant-import" ]; th
 
 USER 1000:1000
 ENV HOME=/home/node
-WORKDIR /home/node
+ENV INDEX_PATH=/home/node/.qmd/index.sqlite
+ENV QMD_CONFIG_DIR=/home/node/.qmd
+# Treat the operator-owned index.yml as global config, not a newly discovered
+# project checkout. Upstream's project-local trust gate otherwise skips all
+# external collection paths while returning a successful update exit status.
+WORKDIR /opt/qmd

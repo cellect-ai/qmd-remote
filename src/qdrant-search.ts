@@ -2,6 +2,7 @@ import type { Database } from "./db.js";
 import type { LLM } from "./llm.js";
 import { METADATA_EXTRACTION_VERSION } from "./metadata.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
+import { getMetadataByFilepath } from "./metadata-store.js";
 import { getContextForFile, type HybridQueryExplain, type HybridQueryResult } from "./store.js";
 import {
   searchQdrant,
@@ -58,6 +59,19 @@ export async function searchQdrantWithMetadata(
   db: Database,
   options: QdrantAdapterOptions,
 ): Promise<HybridQueryResult[]> {
+  // Resolve the complete eligible set before top-K retrieval, not after it.
+  // SQLite owns typed metadata; Qdrant additionally enforces collection + ACL.
+  let documentIds: string[] | undefined;
+  if (options.filter) {
+    const compiled = compileMetadataFilter(options.filter, "d");
+    const rows = db.prepare(`SELECT d.id FROM documents d
+      JOIN document_metadata dm ON dm.document_id = d.id
+      WHERE d.active = 1 AND d.collection IN (${options.collections.map(() => "?").join(",")})
+      AND dm.extraction_version = ? AND dm.extraction_error IS NULL
+      AND ${compiled.sql}`).all(...options.collections, METADATA_EXTRACTION_VERSION, ...compiled.params) as Array<{ id: number }>;
+    documentIds = rows.map(row => String(row.id));
+    if (!documentIds.length) return [];
+  }
   const candidates = filterCandidatesByMetadata(
     db,
     await searchQdrant(db, options.searches, {
@@ -66,10 +80,12 @@ export async function searchQdrantWithMetadata(
       candidateLimit: options.candidateLimit,
       llm: options.llm,
       scope: options.scope,
+      documentIds,
     }),
     options.filter,
   );
   if (candidates.length === 0) return [];
+  const metadata = getMetadataByFilepath(db, candidates.map(candidate => candidate.file));
 
   const primaryQuery = options.searches.find(search => search.type === "lex")?.query
     ?? options.searches.find(search => search.type === "vec")?.query
@@ -99,13 +115,11 @@ export async function searchQdrantWithMetadata(
         rerankScore: rerankScore ?? 0,
         blendedScore: score,
       };
+      const { internalDocumentId: _, ...publicCandidate } = candidate;
       return {
-        ...candidate,
+        ...publicCandidate,
         context: getContextForFile(db, candidate.file),
-        // Qdrant payloads intentionally do not carry arbitrary metadata.
-        // Filtering above consults the local metadata tables; callers that
-        // need metadata can resolve it from the same authoritative index.
-        metadata: {},
+        metadata: metadata.get(candidate.file) ?? {},
         score,
         explain,
       };

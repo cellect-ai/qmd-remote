@@ -71,6 +71,7 @@ import {
 } from "./llm.js";
 import { isQdrantConfigured, type QdrantScope } from "./qdrant.js";
 import { searchQdrantWithMetadata } from "./qdrant-search.js";
+import { getDefaultRemoteLLM, isRemoteConfigured } from "./llm-remote.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -429,7 +430,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     disposeModelsOnInactivity: true,
   });
   internal.llm = localLlm;
-  const qdrantLlm = options.llm ?? localLlm;
+  const qdrantLlm = options.llm ?? (isRemoteConfigured() ? getDefaultRemoteLLM() : localLlm);
 
   const store: QMDStore = {
     internal,
@@ -451,17 +452,16 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       // strict validation used by CLI, MCP, and HTTP before compiling SQL.
       const filter = opts.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
 
-      if (opts.queries) {
-        if (isQdrantConfigured()) {
+      if (isQdrantConfigured()) {
           if (collections.length === 0) {
             throw new Error("Qdrant-backed search requires explicit collections");
           }
-          if (!opts.qdrantScope) {
+          if (!opts.qdrantScope && (process.env.QMD_SCOPED_TOKEN_SECRET_FILE || process.env.QMD_SCOPED_TOKEN_SECRET)) {
             throw new Error("Qdrant-backed search requires a trusted scope assertion");
           }
           return searchQdrantWithMetadata(internal.db, {
             collections,
-            searches: opts.queries,
+            searches: opts.queries ?? (await qdrantLlm.expandQuery(opts.query!)).map(item => ({ type: item.type, query: item.text })),
             llm: qdrantLlm,
             limit: opts.limit ?? 10,
             candidateLimit: opts.candidateLimit ?? 40,
@@ -471,7 +471,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
             scope: opts.qdrantScope,
             filter,
           });
-        }
+      }
+      if (opts.queries) {
         // Pre-expanded queries — use structuredSearch
         return structuredSearch(internal, opts.queries, {
           collections: collections.length > 0 ? collections : undefined,
@@ -510,8 +511,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     expandQuery: async (q) => {
       // The private Qdrant sidecar keeps models on the GPU service. Do not
       // initialise node-llama-cpp locally merely to expand a scoped request.
-      if (isQdrantConfigured() && options.llm) {
-        const expanded = await options.llm.expandQuery(q);
+      if (isQdrantConfigured()) {
+        const expanded = await qdrantLlm.expandQuery(q);
         return expanded.map(item => ({ type: item.type, query: item.text }));
       }
       return internal.expandQuery(q);
