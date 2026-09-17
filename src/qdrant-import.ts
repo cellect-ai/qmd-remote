@@ -274,7 +274,10 @@ export function aclPayloadForDocument(
   }
   const normalizedPath = document.path.replace(/^\.\//, "");
   const matchingEntries = Object.entries(manifest.documents)
-    .filter(([sourcePath]) => handelize(sourcePath) === normalizedPath);
+    // Upstream now preserves existing indexed filenames. Legacy normalized
+    // paths still need the fallback, but exact names (notably doc_<id>.md)
+    // must also resolve. Reject collisions across both forms as before.
+    .filter(([sourcePath]) => sourcePath.replace(/^\.\//, "") === normalizedPath || handelize(sourcePath) === normalizedPath);
   if (matchingEntries.length !== 1) {
     throw new Error(
       matchingEntries.length === 0
