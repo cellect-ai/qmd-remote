@@ -503,7 +503,7 @@ ${!includeLexical ? "- Do NOT output any 'lex:' lines" : ""}
 Final Output:`;
 
     try {
-      const result = await this.generate(prompt, { maxTokens: 1000, temperature: 1 });
+      const result = await this.generate(prompt, { maxTokens: 1000, temperature: 0 });
       if (!result) {
         throw new Error("Generation failed");
       }
@@ -541,13 +541,9 @@ Final Output:`;
     options: RerankOptions = {}
   ): Promise<RerankResult> {
     if (!this.rerankUrl) {
-      // Return documents in original order with default scores
+      // No model evidence: let the caller retain retrieval ranking.
       return {
-        results: documents.map((doc, index) => ({
-          file: doc.file,
-          score: 1 - (index * 0.1), // Decreasing scores
-          index,
-        })),
+        results: [],
         model: "no-rerank",
       };
     }
@@ -563,6 +559,9 @@ Final Output:`;
         for (let i = 0; i < documents.length; i += BATCH_SIZE) {
           const batch = documents.slice(i, i + BATCH_SIZE);
           const batchResult = await this.rerankBatch(query, batch, i);
+          // Never mix real relevance scores with unavailable batches. The
+          // caller must retain retrieval ranking for the entire request.
+          if (batchResult.results.length !== batch.length) return { results: [], model: "rerank-unavailable" };
           allResults.push(...batchResult.results);
           modelName = batchResult.model;
         }
@@ -578,11 +577,7 @@ Final Output:`;
         console.error("Batch rerank error:", error);
         // Fallback
         return {
-          results: documents.map((doc, index) => ({
-            file: doc.file,
-            score: 1 - (index * 0.1),
-            index,
-          })),
+          results: [],
           model: "rerank-fallback",
         };
       }
@@ -598,7 +593,8 @@ Final Output:`;
   private async rerankBatch(
     query: string,
     documents: RerankDocument[],
-    indexOffset: number
+    indexOffset: number,
+    depth = 0,
   ): Promise<RerankResult> {
     try {
       const texts = documents.map(doc => doc.text);
@@ -614,14 +610,29 @@ Final Output:`;
       });
 
       if (!response.ok) {
-        console.error(`Rerank request failed: ${response.status} ${response.statusText}`);
-        // Try to get error details from response body
-        try {
-          const errorText = await response.text();
-          console.error(`Rerank error details: ${errorText}`);
-        } catch (e) {
-          // Ignore if we can't read the error body
+        const detail = await response.text();
+        // The server's physical batch limit can be smaller than its context
+        // window. Retry only that specific failure, preserving all text.
+        if (depth < 6 && /too large to process|exceed_context_size|context.*(?:exceed|overflow)/i.test(detail)) {
+          if (documents.length > 1) {
+            const middle = Math.ceil(documents.length / 2);
+            const left = await this.rerankBatch(query, documents.slice(0, middle), indexOffset, depth + 1);
+            const right = await this.rerankBatch(query, documents.slice(middle), indexOffset + middle, depth + 1);
+            if (left.results.length !== middle || right.results.length !== documents.length - middle) {
+              return { results: [], model: "rerank-unavailable" };
+            }
+            return { results: [...left.results, ...right.results], model: left.model };
+          }
+          const doc = documents[0];
+          if (doc && doc.text.length > 128) {
+            const middle = Math.ceil(doc.text.length / 2);
+            const left = await this.rerankBatch(query, [{ ...doc, text: doc.text.slice(0, middle) }], indexOffset, depth + 1);
+            const right = await this.rerankBatch(query, [{ ...doc, text: doc.text.slice(middle) }], indexOffset, depth + 1);
+            if (!left.results[0] || !right.results[0]) return { results: [], model: "rerank-unavailable" };
+            return { results: [{ file: doc.file, index: indexOffset, score: Math.max(left.results[0].score, right.results[0].score) }], model: left.model };
+          }
         }
+        console.error(`Rerank request failed: ${response.status} ${response.statusText}`);
         throw new Error("Rerank request failed");
       }
 
@@ -629,6 +640,13 @@ Final Output:`;
         results: Array<{ index: number; relevance_score: number }>;
         model: string;
       };
+
+      if (!Array.isArray(data.results) || data.results.length !== documents.length
+        || new Set(data.results.map(item => item.index)).size !== documents.length
+        || data.results.some(item => !Number.isInteger(item.index) || item.index < 0 || item.index >= documents.length
+          || !Number.isFinite(item.relevance_score) || item.relevance_score < 0 || item.relevance_score > 1)) {
+        throw new Error("Invalid reranker response");
+      }
 
       // Map results back to our format (with adjusted indices)
       const results: RerankDocumentResult[] = data.results.map(item => ({
@@ -646,13 +664,9 @@ Final Output:`;
       };
     } catch (error) {
       console.error("Rerank batch error:", error);
-      // Return documents in original order with default scores
+      // No fabricated position scores: the caller retains retrieval ranking.
       return {
-        results: documents.map((doc, index) => ({
-          file: doc.file,
-          score: 1 - (index * 0.1),
-          index: indexOffset + index,
-        })),
+        results: [],
         model: "rerank-fallback",
       };
     }

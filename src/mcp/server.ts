@@ -33,6 +33,7 @@ import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 import { getDefaultRemoteLLM, isRemoteConfigured } from "../llm-remote.js";
+import { scopedDocumentSnippet } from "../search-snippet.js";
 import {
   bearerToken as scopedBearerToken,
   loadScopedSearchConfig,
@@ -1122,9 +1123,8 @@ export async function startMcpHttpServer(
         });
         const formatted = results.flatMap(result => {
           if (!result.externalDocumentId) return [];
-          const { line, snippet } = extractSnippet(
-            result.body, primaryQuery, 300, result.bestChunkPos, result.bestChunk.length,
-            params.intent as string | undefined,
+          const { line, snippet } = scopedDocumentSnippet(
+            result.body, primaryQuery, result.bestChunkPos, result.bestChunk.length,
           );
           return [{
             documentId: result.externalDocumentId,
@@ -1132,7 +1132,7 @@ export async function startMcpHttpServer(
             title: result.title,
             score: Math.round(result.score * 100) / 100,
             line,
-            snippet: addLineNumbers(snippet, line),
+            snippet,
           }];
         });
         nodeRes.writeHead(200, { "Content-Type": "application/json" });

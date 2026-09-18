@@ -461,7 +461,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           }
           return searchQdrantWithMetadata(internal.db, {
             collections,
-            searches: opts.queries ?? (await qdrantLlm.expandQuery(opts.query!)).map(item => ({ type: item.type, query: item.text })),
+            searches: opts.queries ?? await store.expandQuery(opts.query!),
             llm: qdrantLlm,
             limit: opts.limit ?? 10,
             candidateLimit: opts.candidateLimit ?? 40,
@@ -513,7 +513,14 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       // initialise node-llama-cpp locally merely to expand a scoped request.
       if (isQdrantConfigured()) {
         const expanded = await qdrantLlm.expandQuery(q);
-        return expanded.map(item => ({ type: item.type, query: item.text }));
+        // Keep the user's exact words in both retrieval lanes and as the first
+        // lexical query used by the private reranker. Rewrites only supplement.
+        return [
+          { type: "lex" as const, query: q },
+          { type: "vec" as const, query: q },
+          ...expanded.filter(item => item.text.trim().toLocaleLowerCase() !== q.trim().toLocaleLowerCase())
+            .slice(0, 8).map(item => ({ type: item.type, query: item.text })),
+        ];
       }
       return internal.expandQuery(q);
     },

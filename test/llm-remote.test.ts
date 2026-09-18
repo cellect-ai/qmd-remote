@@ -6,6 +6,45 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("RemoteLLM honest reranking", () => {
+  test("never invents relevance when the server fails", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: "unavailable" }, { status: 503 })));
+    const result = await new RemoteLLM({ rerankUrl: "http://rerank.test" }).rerank("person", [{ file: "tax", text: "unrelated" }]);
+    expect(result.results).toEqual([]);
+  });
+
+  test("a failed later batch invalidates earlier scores instead of promoting arbitrary batch positions", async () => {
+    let calls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+      const docs = JSON.parse(String(init?.body)).documents;
+      if (++calls === 2) return Response.json({ error: "unavailable" }, { status: 503 });
+      return Response.json({ results: docs.map((_: string, index: number) => ({ index, relevance_score: 0.1 })), model: "test" });
+    }));
+    const docs = Array.from({ length: 11 }, (_, i) => ({ file: String(i), text: "text" }));
+    expect((await new RemoteLLM({ rerankUrl: "http://rerank.test" }).rerank("person", docs)).results).toEqual([]);
+  });
+
+  test("splits overflow batches and complete long documents, retaining a match in the second half", async () => {
+    const seen: string[][] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+      const docs = JSON.parse(String(init?.body)).documents as string[];
+      seen.push(docs);
+      if (docs.length > 1 || docs.some(text => text.length > 150)) return Response.json({ error: { message: "input is too large to process. increase the physical batch size" } }, { status: 500 });
+      return Response.json({ results: docs.map((text, index) => ({ index, relevance_score: text.includes("Zorzal") ? 0.9 : 0.1 })), model: "test" });
+    }));
+    const longText = "a".repeat(220) + "Zorzal";
+    const result = await new RemoteLLM({ rerankUrl: "http://rerank.test" }).rerank("Zorzal", [{ file: "agreement", text: longText }, { file: "tax", text: "tax" }]);
+    expect(result.results).toEqual([{ file: "agreement", index: 0, score: 0.9 }, { file: "tax", index: 1, score: 0.1 }]);
+    expect(seen).toContainEqual([longText.slice(0, 113)]);
+    expect(seen).toContainEqual([longText.slice(113)]);
+  });
+
+  test("rejects duplicate indices instead of accepting a partially scored candidate set", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ results: [{ index: 0, relevance_score: 0.9 }, { index: 0, relevance_score: 0.8 }] })));
+    expect((await new RemoteLLM({ rerankUrl: "http://rerank.test" }).rerank("name", [{ file: "a", text: "a" }, { file: "b", text: "b" }])).results).toEqual([]);
+  });
+});
+
 describe("RemoteLLM generation authorization", () => {
   test("uses the runtime-only generation API key for generation and health", async () => {
     vi.stubEnv("QMD_GENERATE_API_KEY", "runtime-product-key");
