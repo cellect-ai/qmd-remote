@@ -1,5 +1,6 @@
 import type { Database } from "./db.js";
 import type { LLM } from "./llm.js";
+import { documentIdentity, identityCoverage } from "./search-identity.js";
 import { METADATA_EXTRACTION_VERSION } from "./metadata.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import { getMetadataByFilepath } from "./metadata-store.js";
@@ -92,6 +93,9 @@ export async function searchQdrantWithMetadata(
     ?? options.searches[0]?.query
     ?? "";
   const rerankScores = new Map<string, number>();
+  const identities = candidates.map(candidate => documentIdentity(candidate.title, candidate.body, metadata.get(candidate.file)));
+  const coverage = identityCoverage(primaryQuery, identities);
+  const hasIdentityEvidence = coverage.some(value => value > 0);
   if (options.rerank) {
     const reranked = await options.llm.rerank(
       options.intent ? `${options.intent}\n\n${primaryQuery}` : primaryQuery,
@@ -99,7 +103,7 @@ export async function searchQdrantWithMetadata(
         file: candidate.file,
         // A signature/party can live outside the selected chunk. Give the
         // ranker authoritative identity/type context, not only boilerplate.
-        text: `Document: ${candidate.title}\nMetadata: ${JSON.stringify(metadata.get(candidate.file) ?? {})}\n\n${candidate.bestChunk}`,
+        text: `Document identity: ${identities[candidates.indexOf(candidate)]}\n\n${candidate.bestChunk}`,
       })),
     );
     for (const result of reranked.results) rerankScores.set(result.file, result.score);
@@ -108,9 +112,10 @@ export async function searchQdrantWithMetadata(
   return candidates
     .map((candidate, index) => {
       const rerankScore = rerankScores.get(candidate.file);
-      const score = rerankScore === undefined
+      const semanticScore = rerankScore === undefined
         ? candidate.score
         : (0.4 * candidate.score) + (0.6 * rerankScore);
+      const score = hasIdentityEvidence ? 0.6 * coverage[index]! + 0.4 * semanticScore : semanticScore;
       const explain: HybridQueryExplain = {
         ftsScores: [], vectorScores: [],
         rrf: {
