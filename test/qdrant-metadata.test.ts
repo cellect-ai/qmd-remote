@@ -41,6 +41,17 @@ const search = (filter?: any, rerank = false) => searchQdrantWithMetadata(store.
   limit: 10, candidateLimit: 40, minScore: 0, rerank, llm, scope, filter,
 });
 describe("Qdrant typed metadata with private ACL", () => {
+  test("relative retrieval rank cannot rescue a model-rejected nonexistent name", async () => {
+    await addDoc(1, "approved");
+    vi.mocked(llm.rerank).mockResolvedValueOnce({ results: [{ file: "qmd://rooms-shape/1.md", score: 0.001, index: 0 }], model: "test" });
+    expect(await search(undefined, true)).toEqual([]);
+  });
+  test("missing model evidence retains retrieval scores without manufacturing relevance", async () => {
+    await addDoc(1, "approved");
+    const baseline = await search();
+    vi.mocked(llm.rerank).mockResolvedValueOnce({ results: [], model: "rerank-unavailable" });
+    expect((await search(undefined, true)).map(r => r.score)).toEqual(baseline.map(r => r.score));
+  });
   test("narrows before top-K and returns authoritative metadata and precise snippet offsets", async () => {
     for (let i = 0; i < 120; i++) await addDoc(i, i === 119 ? "approved" : "draft");
     const results = await search({ key: "status", operator: "eq", value: "approved" }, true);
@@ -56,6 +67,7 @@ describe("Qdrant typed metadata with private ACL", () => {
       ]));
     }
     expect(llm.embedBatch).toHaveBeenCalled(); expect(llm.rerank).toHaveBeenCalled();
+    expect(vi.mocked(llm.rerank).mock.calls.at(-1)?.[1][0]?.text).toContain('"parties":["Lucas Zorzal"]');
     const result = results[0]!;
     const snippet = extractSnippet(result.body, "Zorzal", 300, result.bestChunkPos, result.bestChunk.length);
     expect(snippet.snippet).toContain("Zorzal");

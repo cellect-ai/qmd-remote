@@ -95,7 +95,12 @@ export async function searchQdrantWithMetadata(
   if (options.rerank) {
     const reranked = await options.llm.rerank(
       options.intent ? `${options.intent}\n\n${primaryQuery}` : primaryQuery,
-      candidates.map(candidate => ({ file: candidate.file, text: candidate.bestChunk })),
+      candidates.map(candidate => ({
+        file: candidate.file,
+        // A signature/party can live outside the selected chunk. Give the
+        // ranker authoritative identity/type context, not only boilerplate.
+        text: `Document: ${candidate.title}\nMetadata: ${JSON.stringify(metadata.get(candidate.file) ?? {})}\n\n${candidate.bestChunk}`,
+      })),
     );
     for (const result of reranked.results) rerankScores.set(result.file, result.score);
   }
@@ -124,7 +129,11 @@ export async function searchQdrantWithMetadata(
         explain,
       };
     })
-    .filter(candidate => candidate.score >= options.minScore)
+    // RRF is a relative position, not relevance: even a nonsense query has a
+    // first result. Do not let its 40% share rescue a confident model rejection.
+    // No model scores means retrieval-only fallback, not invented confidence.
+    .filter(candidate => (!rerankScores.has(candidate.file) || rerankScores.get(candidate.file)! >= 0.05)
+      && candidate.score >= options.minScore)
     .sort((left, right) => right.score - left.score)
     .slice(0, options.limit);
 }
