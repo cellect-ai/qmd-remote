@@ -18,3 +18,18 @@ export function documentIdentity(title: string, body: string, metadata: unknown)
   const sourceTitle = body.match(/^title:\s*(.+)$/m)?.[1] ?? "";
   return `${title} ${sourceTitle} ${JSON.stringify(metadata ?? {})}`;
 }
+
+/** Prefer the requested document kind over correspondence mentioning it.
+ * This is a small ordering signal, not a status filter: a void agreement must
+ * remain findable, and asking for its void confirmation should favor that type.
+ */
+export function documentTypeBoost(query: string, metadata: unknown): number {
+  if (!metadata || typeof metadata !== "object" || !("type" in metadata)
+    || typeof metadata.type !== "string") return 0;
+  const kind = [...tokens(metadata.type)];
+  const requested = [...tokens(query)];
+  const qualifiers = ["void", "termination", "cancellation", "amendment", "addendum"];
+  const explicit = qualifiers.filter(term => requested.includes(term));
+  if (explicit.length) return explicit.every(term => kind.includes(term)) ? 0.1 : 0;
+  return kind.length > 0 && kind.every(term => requested.includes(term)) ? 0.1 : 0;
+}

@@ -1,6 +1,6 @@
 import type { Database } from "./db.js";
 import type { LLM } from "./llm.js";
-import { documentIdentity, identityCoverage } from "./search-identity.js";
+import { documentIdentity, identityCoverage, documentTypeBoost } from "./search-identity.js";
 import { METADATA_EXTRACTION_VERSION } from "./metadata.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import { getMetadataByFilepath } from "./metadata-store.js";
@@ -99,11 +99,11 @@ export async function searchQdrantWithMetadata(
   if (options.rerank) {
     const reranked = await options.llm.rerank(
       options.intent ? `${options.intent}\n\n${primaryQuery}` : primaryQuery,
-      candidates.map(candidate => ({
+      candidates.map((candidate, index) => ({
         file: candidate.file,
         // A signature/party can live outside the selected chunk. Give the
         // ranker authoritative identity/type context, not only boilerplate.
-        text: `Document identity: ${identities[candidates.indexOf(candidate)]}\n\n${candidate.bestChunk}`,
+        text: `Document identity: ${identities[index]}\n\n${candidate.bestChunk}`,
       })),
     );
     for (const result of reranked.results) rerankScores.set(result.file, result.score);
@@ -115,7 +115,8 @@ export async function searchQdrantWithMetadata(
       const semanticScore = rerankScore === undefined
         ? candidate.score
         : (0.4 * candidate.score) + (0.6 * rerankScore);
-      const score = hasIdentityEvidence ? 0.6 * coverage[index]! + 0.4 * semanticScore : semanticScore;
+      const blended = hasIdentityEvidence ? 0.6 * coverage[index]! + 0.4 * semanticScore : semanticScore;
+      const score = 0.9 * blended + documentTypeBoost(primaryQuery, metadata.get(candidate.file));
       const explain: HybridQueryExplain = {
         ftsScores: [], vectorScores: [],
         rrf: {
