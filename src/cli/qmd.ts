@@ -905,7 +905,7 @@ function manageTrust(subcommand?: string): void {
   console.log(`${c.dim}Editing a hook, out-of-project path, or custom model will ask again. Revoke with 'qmd trust revoke'.${c.reset}`);
 }
 
-async function updateCollections(fullCheck: boolean = false): Promise<void> {
+async function updateCollections(fullCheck: boolean = false, requestedNames?: string[]): Promise<void> {
   // Prompt before opening the store so an approval is visible to getStore (#889).
   const allowed = await resolveLocalConfigTrust();
 
@@ -916,7 +916,21 @@ async function updateCollections(fullCheck: boolean = false): Promise<void> {
   // Clear Ollama cache on update
   clearCache(db);
 
-  const collections = listCollections(db);
+  const allCollections = listCollections(db);
+  const requested = requestedNames && requestedNames.length > 0
+    ? new Set(requestedNames)
+    : undefined;
+  const collections = requested
+    ? allCollections.filter(collection => requested.has(collection.name))
+    : allCollections;
+
+  if (requested) {
+    const found = new Set(collections.map(collection => collection.name));
+    const unknown = [...requested].filter(name => !found.has(name));
+    if (unknown.length > 0) {
+      throw new Error(`Collection not found: ${unknown.join(", ")}`);
+    }
+  }
 
   if (collections.length === 0) {
     console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
@@ -4590,7 +4604,7 @@ if (isMain) {
       break;
 
     case "update":
-      await updateCollections(!!cli.values.full);
+      await updateCollections(!!cli.values.full, cli.values.collection as string[] | undefined);
       break;
 
     case "trust":

@@ -120,6 +120,9 @@ describe("Qdrant collection security domains", () => {
     ["rooms-shape-24-bright", "shape"],
     ["rooms-cellect", "cellect"],
     ["rooms-cellect-corporate", "cellect"],
+    ["cellect_docs", "cellect"],
+    ["rooms-other", "shape"],
+    ["rooms-cellectx", "shape"],
   ])("maps %s to %s", (collection, domain) => {
     expect(qdrantDomainForCollection(collection)).toBe(domain);
   });

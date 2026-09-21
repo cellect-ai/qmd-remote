@@ -105,9 +105,17 @@ function config() {
     aliases: {
       public: process.env.QMD_QDRANT_PUBLIC_COLLECTION || "cellect_public_current",
       shape: process.env.QMD_QDRANT_SHAPE_COLLECTION || "tenant_shape_current",
-      cellect: process.env.QMD_QDRANT_CELLECT_COLLECTION || "rooms_cellect_current",
+      // No default: central (`cellect_docs`) and the Rooms sidecar
+      // (`rooms-cellect*`) write different Cellect aliases.
+      cellect: process.env.QMD_QDRANT_CELLECT_COLLECTION?.trim() ?? "",
     } satisfies Record<QdrantDomain, string>,
   };
+}
+
+function alias(endpoint: ReturnType<typeof config>, domain: QdrantDomain): string {
+  const name = endpoint.aliases[domain];
+  if (!name) throw new Error(`QMD_QDRANT_CELLECT_COLLECTION is required to import ${domain} collections`);
+  return name;
 }
 
 async function upsert(
@@ -116,7 +124,7 @@ async function upsert(
   points: QdrantPoint[],
 ): Promise<void> {
   if (points.length === 0) return;
-  const url = `${endpoint.url}/collections/${encodeURIComponent(endpoint.aliases[domain])}/points?wait=true`;
+  const url = `${endpoint.url}/collections/${encodeURIComponent(alias(endpoint, domain))}/points?wait=true`;
   let lastError: unknown;
   for (let attempt = 1; attempt <= 6; attempt++) {
     try {
@@ -150,7 +158,7 @@ async function deleteDocumentPoints(
   domain: QdrantDomain,
   documentId: number,
 ): Promise<void> {
-  const url = `${endpoint.url}/collections/${encodeURIComponent(endpoint.aliases[domain])}/points/delete?wait=true`;
+  const url = `${endpoint.url}/collections/${encodeURIComponent(alias(endpoint, domain))}/points/delete?wait=true`;
   const response = await fetch(url, {
     method: "POST",
     headers: {
@@ -173,7 +181,7 @@ async function documentPointIds(
   domain: QdrantDomain,
   documentId: number,
 ): Promise<Array<number | string>> {
-  const url = `${endpoint.url}/collections/${encodeURIComponent(endpoint.aliases[domain])}/points/scroll`;
+  const url = `${endpoint.url}/collections/${encodeURIComponent(alias(endpoint, domain))}/points/scroll`;
   const ids: Array<number | string> = [];
   let offset: number | string | null = null;
   do {
@@ -219,7 +227,7 @@ async function deletePointIds(
   ids: Array<number | string>,
 ): Promise<void> {
   if (ids.length === 0) return;
-  const url = `${endpoint.url}/collections/${encodeURIComponent(endpoint.aliases[domain])}/points/delete?wait=true`;
+  const url = `${endpoint.url}/collections/${encodeURIComponent(alias(endpoint, domain))}/points/delete?wait=true`;
   for (let offset = 0; offset < ids.length; offset += 100) {
     const response = await fetch(url, {
       method: "POST",
@@ -521,12 +529,14 @@ async function syncChangedDocuments(
   batchSize: number,
   concurrency: number,
   documentConcurrency: number,
+  collection?: string,
 ): Promise<{ updated: number; removed: number; points: number }> {
   const documentQuery = source.prepare(`
     SELECT d.id, d.collection, d.path, d.title, d.hash, d.modified_at, c.doc AS body
     FROM documents d
     JOIN content c ON c.hash = d.hash
     WHERE d.active = 1 AND d.id > ?
+      ${collection ? "AND d.collection = ?" : ""}
     ORDER BY d.id
     LIMIT 25
   `);
@@ -537,7 +547,9 @@ async function syncChangedDocuments(
   let points = 0;
   let cursor = 0;
   while (true) {
-    const documents = documentQuery.all(cursor) as DocumentRow[];
+    const documents = (collection
+      ? documentQuery.all(cursor, collection)
+      : documentQuery.all(cursor)) as DocumentRow[];
     if (documents.length === 0) break;
     const changed: Array<{ document: DocumentRow; replaceExisting: boolean }> = [];
     for (const document of documents) {
@@ -586,13 +598,21 @@ async function syncChangedDocuments(
     }
   }
 
-  const stale = manifest.prepare(`
-    SELECT document_id, collection FROM qdrant_documents ORDER BY document_id
-  `).all() as Array<{ document_id: number; collection: string }>;
-  const activeLookup = source.prepare(`SELECT 1 AS present FROM documents WHERE id = ? AND active = 1`);
+  const staleQuery = manifest.prepare(`
+    SELECT document_id, collection FROM qdrant_documents
+    ${collection ? "WHERE collection = ?" : ""}
+    ORDER BY document_id
+  `);
+  const stale = (collection
+    ? staleQuery.all(collection)
+    : staleQuery.all()) as Array<{ document_id: number; collection: string }>;
+  const activeLookup = source.prepare(`
+    SELECT 1 AS present FROM documents
+    WHERE id = ? AND collection = ? AND active = 1
+  `);
   let removed = 0;
   for (const document of stale) {
-    if (activeLookup.get(document.document_id)) continue;
+    if (activeLookup.get(document.document_id, document.collection)) continue;
     await deleteDocumentPoints(endpoint, qdrantDomainForCollection(document.collection), document.document_id);
     manifest.prepare(`DELETE FROM qdrant_documents WHERE document_id = ?`).run(document.document_id);
     removed += 1;
@@ -602,8 +622,22 @@ async function syncChangedDocuments(
 
 export async function importQdrant(): Promise<void> {
   const dbPath = argument("--db", process.env.QMD_INDEX_PATH || "/home/node/.qmd/index.sqlite")!;
-  const statePath = argument("--state", process.env.QMD_QDRANT_IMPORT_STATE || "/home/node/.qmd/qdrant-import.json")!;
-  const manifestPath = argument("--manifest", process.env.QMD_QDRANT_MANIFEST || "/home/node/.qmd/qdrant-manifest.sqlite")!;
+  const collection = argument("--collection");
+  if (collection && !/^[A-Za-z0-9._-]+$/.test(collection)) {
+    throw new Error("--collection must contain only letters, digits, dot, underscore, or hyphen");
+  }
+  const statePath = argument(
+    "--state",
+    process.env.QMD_QDRANT_IMPORT_STATE || (collection
+      ? `/home/node/.qmd/qdrant-import-${collection}.json`
+      : "/home/node/.qmd/qdrant-import.json"),
+  )!;
+  const manifestPath = argument(
+    "--manifest",
+    process.env.QMD_QDRANT_MANIFEST || (collection
+      ? `/home/node/.qmd/qdrant-manifest-${collection}.sqlite`
+      : "/home/node/.qmd/qdrant-manifest.sqlite"),
+  )!;
   const batchSize = Math.max(1, integerArgument("--batch-size", 96));
   const concurrency = Math.max(1, Math.min(16, integerArgument("--concurrency", 4)));
   const documentConcurrency = Math.max(1, Math.min(32, integerArgument("--document-concurrency", 4)));
@@ -628,12 +662,14 @@ export async function importQdrant(): Promise<void> {
   const manifest = openDatabase(manifestPath);
   initializeManifest(manifest);
   const endpoint = config();
+  if (domainArg === "cellect") alias(endpoint, "cellect");
   const embedder = getDefaultRemoteLLM();
   const documentQuery = db.prepare(`
     SELECT d.id, d.collection, d.path, d.title, d.hash, d.modified_at, c.doc AS body
     FROM documents d
     JOIN content c ON c.hash = d.hash
     WHERE d.active = 1 AND d.id > ?
+      ${collection ? "AND d.collection = ?" : ""}
     ORDER BY d.id
     LIMIT ?
   `);
@@ -663,7 +699,9 @@ export async function importQdrant(): Promise<void> {
     }
     while (documentLimit === 0 || processedThisRun < documentLimit) {
       const fetchLimit = Math.min(32, documentLimit === 0 ? 32 : documentLimit - processedThisRun);
-      const documents = documentQuery.all(cursor, fetchLimit) as DocumentRow[];
+      const documents = (collection
+        ? documentQuery.all(cursor, collection, fetchLimit)
+        : documentQuery.all(cursor, fetchLimit)) as DocumentRow[];
       if (documents.length === 0) break;
 
       for (let offset = 0; offset < documents.length; offset += documentConcurrency) {
@@ -709,7 +747,7 @@ export async function importQdrant(): Promise<void> {
       }
     }
     reconciliation = documentLimit === 0
-      ? await syncChangedDocuments(db, manifest, endpoint, embedder, batchSize, concurrency, documentConcurrency)
+      ? await syncChangedDocuments(db, manifest, endpoint, embedder, batchSize, concurrency, documentConcurrency, collection)
       : { updated: 0, removed: 0, points: 0 };
     if (documentLimit === 0 && domainArg === "all") {
       const totals = manifest.prepare(`

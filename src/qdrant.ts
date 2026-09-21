@@ -68,6 +68,7 @@ type QdrantGroup = {
 };
 
 const SHAPE_COLLECTIONS = new Set(["wip", "shape_docusign"]);
+const CELLECT_COLLECTIONS = new Set(["cellect_docs"]);
 const PUBLIC_COLLECTION_PREFIXES = [
   "jersey_city_",
   "nj_",
@@ -78,6 +79,8 @@ const PUBLIC_COLLECTION_PREFIXES = [
 ];
 
 export function qdrantDomainForCollection(collection: string): QdrantDomain {
+  // Both Cellect name rules come before the `rooms-` -> shape rule.
+  if (CELLECT_COLLECTIONS.has(collection)) return "cellect";
   if (collection === "rooms-cellect" || collection.startsWith("rooms-cellect-")) {
     return "cellect";
   }
@@ -99,6 +102,23 @@ export function qdrantDomainForCollection(collection: string): QdrantDomain {
 
 export function isQdrantConfigured(): boolean {
   return Boolean(process.env.QMD_QDRANT_URL || process.env.QDRANT_URL);
+}
+
+const CELLECT_ALIAS_REQUIRED = "QMD_QDRANT_CELLECT_COLLECTION is required when QMD_QDRANT_ALLOWED_DOMAINS allows cellect";
+
+function allowsCellectWithoutAlias(env: NodeJS.ProcessEnv): boolean {
+  const allowed = (env.QMD_QDRANT_ALLOWED_DOMAINS || "").split(",").map(value => value.trim());
+  return allowed.includes("cellect") && !env.QMD_QDRANT_CELLECT_COLLECTION?.trim();
+}
+
+/**
+ * Startup check for a Qdrant-backed process: a Cellect domain must name its
+ * alias. Other settings keep failing on first use, as before.
+ */
+export function validateQdrantConfig(env: NodeJS.ProcessEnv = process.env): void {
+  if ((env.QMD_QDRANT_URL || env.QDRANT_URL) && allowsCellectWithoutAlias(env)) {
+    throw new Error(CELLECT_ALIAS_REQUIRED);
+  }
 }
 
 export function parseQdrantLexQuery(query: string): QdrantLexQuery {
@@ -146,6 +166,11 @@ function loadQdrantConfig(): QdrantConfig {
   if (allowedDomains.size === 0) {
     throw new Error("QMD_QDRANT_ALLOWED_DOMAINS must explicitly allow public, shape, and/or cellect");
   }
+  // The central index (`cellect_docs` -> tenant_cellect_current) and the Rooms
+  // sidecar (`rooms-cellect*` -> rooms_cellect_current) use different Cellect
+  // aliases, so there is no safe default: every Cellect process names its own.
+  if (allowsCellectWithoutAlias(process.env)) throw new Error(CELLECT_ALIAS_REQUIRED);
+  const cellectAlias = process.env.QMD_QDRANT_CELLECT_COLLECTION?.trim() ?? "";
 
   return {
     url,
@@ -153,7 +178,7 @@ function loadQdrantConfig(): QdrantConfig {
     aliases: {
       public: process.env.QMD_QDRANT_PUBLIC_COLLECTION || "cellect_public_current",
       shape: process.env.QMD_QDRANT_SHAPE_COLLECTION || "tenant_shape_current",
-      cellect: process.env.QMD_QDRANT_CELLECT_COLLECTION || "rooms_cellect_current",
+      cellect: cellectAlias,
     },
     allowedDomains,
   };

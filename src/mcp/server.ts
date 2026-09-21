@@ -40,6 +40,14 @@ import {
   ScopedAuthError,
   verifyScopedSearchToken,
 } from "../scoped-auth.js";
+import { isQdrantConfigured, validateQdrantConfig } from "../qdrant.js";
+import {
+  authorizeQueryCollections,
+  loadQueryApiAuthConfig,
+  QueryApiAuthError,
+  queryApiBearerToken,
+  verifyQueryApiToken,
+} from "../query-auth.js";
 
 // =============================================================================
 // Types for structured content
@@ -924,6 +932,16 @@ export async function startMcpHttpServer(
   const startTime = Date.now();
   const quiet = options?.quiet ?? false;
   const scopedSearchConfig = loadScopedSearchConfig();
+  const queryApiAuthConfig = loadQueryApiAuthConfig();
+  // A process is either a private scoped sidecar or an identity-authenticated
+  // central endpoint. Combining them would put two authorization models on
+  // one index, so refuse to start.
+  if (scopedSearchConfig && queryApiAuthConfig) {
+    throw new Error("QMD_SCOPED_* and QMD_QUERY_AUTH_FILE cannot both be configured");
+  }
+  // Fail at startup, not on the first query, when the Qdrant backend is
+  // misconfigured (for example a Cellect domain without its alias).
+  validateQdrantConfig();
 
   /** Format timestamp for request logging */
   function ts(): string {
@@ -1143,7 +1161,9 @@ export async function startMcpHttpServer(
 
       // A configured private sidecar exposes only authenticated scoped search
       // and health, never generic MCP/get/query routes over the same index.
-      if (scopedSearchConfig) {
+      // When QMD is published with identity auth, the generic MCP protocol has
+      // no tenant-aware collection policy either, so it is unavailable too.
+      if (scopedSearchConfig || (pathname === "/mcp" && queryApiAuthConfig)) {
         nodeRes.writeHead(404, { "Content-Type": "application/json" });
         nodeRes.end(JSON.stringify({ error: "Not found" }));
         return;
@@ -1173,6 +1193,53 @@ export async function startMcpHttpServer(
           nodeRes.writeHead(400, { "Content-Type": "application/json" });
           nodeRes.end(JSON.stringify({ error: "Missing required field: searches (array)" }));
           return;
+        }
+        const validSearches = params.searches.length >= 1
+          && params.searches.length <= 10
+          && (params.searches as RestSearchInput[]).every((search) => (
+            ["lex", "vec", "hyde"].includes(search?.type as string)
+            && typeof search?.query === "string"
+            && search.query.length >= 1
+            && search.query.length <= 4096
+          ));
+        const validCollections = params.collections === undefined || (
+          Array.isArray(params.collections)
+          && params.collections.length <= 50
+          && (params.collections as unknown[]).every((collection) => (
+            typeof collection === "string" && collection.length >= 1 && collection.length <= 200
+          ))
+        );
+        const validLimit = params.limit === undefined || (
+          Number.isSafeInteger(params.limit) && (params.limit as number) >= 1 && (params.limit as number) <= 100
+        );
+        const validCandidateLimit = params.candidateLimit === undefined || (
+          Number.isSafeInteger(params.candidateLimit)
+          && (params.candidateLimit as number) >= 1
+          && (params.candidateLimit as number) <= 100
+        );
+        const validMinScore = params.minScore === undefined || (
+          typeof params.minScore === "number" && params.minScore >= 0 && params.minScore <= 1
+        );
+        const validIntent = params.intent === undefined || (
+          typeof params.intent === "string" && params.intent.length <= 1000
+        );
+        if (
+          !validSearches || !validCollections || !validLimit
+          || !validCandidateLimit || !validMinScore || !validIntent
+        ) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Invalid search parameters" }));
+          return;
+        }
+        if ((isQdrantConfigured() || queryApiAuthConfig) && (!Array.isArray(params.collections) || params.collections.length === 0)) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Qdrant-backed search requires explicit collections" }));
+          return;
+        }
+
+        if (queryApiAuthConfig) {
+          const identity = verifyQueryApiToken(queryApiBearerToken(nodeReq.headers.authorization), queryApiAuthConfig);
+          authorizeQueryCollections(identity, (params.collections as string[] | undefined) ?? []);
         }
 
         // Map to internal format
@@ -1274,9 +1341,10 @@ export async function startMcpHttpServer(
       nodeRes.writeHead(404);
       nodeRes.end("Not Found");
     } catch (err) {
-      if (err instanceof ScopedAuthError) {
-        nodeRes.writeHead(401, { "Content-Type": "application/json" });
-        nodeRes.end(JSON.stringify({ error: "Unauthorized" }));
+      if (err instanceof ScopedAuthError || err instanceof QueryApiAuthError) {
+        const status = err instanceof QueryApiAuthError ? err.status : 401;
+        nodeRes.writeHead(status, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ error: status === 403 ? "Forbidden" : "Unauthorized" }));
         log(`${ts()} scoped request rejected (${Date.now() - reqStart}ms)`);
         return;
       }
