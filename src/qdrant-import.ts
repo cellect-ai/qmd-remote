@@ -105,6 +105,7 @@ function config() {
     aliases: {
       public: process.env.QMD_QDRANT_PUBLIC_COLLECTION || "cellect_public_current",
       shape: process.env.QMD_QDRANT_SHAPE_COLLECTION || "tenant_shape_current",
+      cellect: process.env.QMD_QDRANT_CELLECT_COLLECTION || "rooms_cellect_current",
     } satisfies Record<QdrantDomain, string>,
   };
 }
@@ -610,8 +611,8 @@ export async function importQdrant(): Promise<void> {
   const documentId = integerArgument("--document-id", 0);
   const rebuild = process.argv.includes("--rebuild");
   const domainArg = argument("--domain", "all");
-  if (!domainArg || !["all", "public", "shape"].includes(domainArg)) {
-    throw new Error("--domain must be all, public, or shape");
+  if (!domainArg || !["all", "public", "shape", "cellect"].includes(domainArg)) {
+    throw new Error("--domain must be all, public, shape, or cellect");
   }
 
   const state = readState(statePath);
