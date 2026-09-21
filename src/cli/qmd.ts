@@ -556,7 +556,7 @@ async function showStatus(): Promise<void> {
   closeDb();
 }
 
-async function updateCollections(fullCheck: boolean = false): Promise<void> {
+async function updateCollections(fullCheck: boolean = false, requestedNames?: string[]): Promise<void> {
   const db = getDb();
   const storeInstance = getStore();
   // Collections are defined in YAML; no duplicate cleanup needed.
@@ -564,7 +564,21 @@ async function updateCollections(fullCheck: boolean = false): Promise<void> {
   // Clear Ollama cache on update
   clearCache(db);
 
-  const collections = listCollections(db);
+  const allCollections = listCollections(db);
+  const requested = requestedNames && requestedNames.length > 0
+    ? new Set(requestedNames)
+    : undefined;
+  const collections = requested
+    ? allCollections.filter(collection => requested.has(collection.name))
+    : allCollections;
+
+  if (requested) {
+    const found = new Set(collections.map(collection => collection.name));
+    const unknown = [...requested].filter(name => !found.has(name));
+    if (unknown.length > 0) {
+      throw new Error(`Collection not found: ${unknown.join(", ")}`);
+    }
+  }
 
   if (collections.length === 0) {
     console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
@@ -3090,7 +3104,7 @@ if (isMain) {
       break;
 
     case "update":
-      await updateCollections(!!cli.values.full);
+      await updateCollections(!!cli.values.full, cli.values.collection as string[] | undefined);
       break;
 
     case "embed":

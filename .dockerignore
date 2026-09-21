@@ -1,0 +1,8 @@
+.git
+.work
+node_modules
+dist
+coverage
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

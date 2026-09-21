@@ -2,7 +2,7 @@ import type { Database } from "./db.js";
 import { formatQueryForEmbedding, type LLM } from "./llm.js";
 import { readFileSync } from "node:fs";
 
-export type QdrantDomain = "public" | "shape";
+export type QdrantDomain = "public" | "shape" | "cellect";
 
 export type QdrantSearch = {
   type: "lex" | "vec" | "hyde";
@@ -64,6 +64,7 @@ type QdrantGroup = {
 };
 
 const SHAPE_COLLECTIONS = new Set(["wip", "shape_docusign"]);
+const CELLECT_COLLECTIONS = new Set(["cellect_docs"]);
 const PUBLIC_COLLECTION_PREFIXES = [
   "jersey_city_",
   "nj_",
@@ -74,6 +75,7 @@ const PUBLIC_COLLECTION_PREFIXES = [
 ];
 
 export function qdrantDomainForCollection(collection: string): QdrantDomain {
+  if (CELLECT_COLLECTIONS.has(collection)) return "cellect";
   if (
     SHAPE_COLLECTIONS.has(collection)
     || collection.startsWith("project-")
@@ -132,7 +134,7 @@ function loadQdrantConfig(): QdrantConfig {
     rawAllowed.split(",").map(value => value.trim()).filter(Boolean) as QdrantDomain[],
   );
   for (const domain of allowedDomains) {
-    if (domain !== "public" && domain !== "shape") {
+    if (domain !== "public" && domain !== "shape" && domain !== "cellect") {
       throw new Error(`Unknown Qdrant security domain: ${domain}`);
     }
   }
@@ -146,6 +148,7 @@ function loadQdrantConfig(): QdrantConfig {
     aliases: {
       public: process.env.QMD_QDRANT_PUBLIC_COLLECTION || "cellect_public_current",
       shape: process.env.QMD_QDRANT_SHAPE_COLLECTION || "tenant_shape_current",
+      cellect: process.env.QMD_QDRANT_CELLECT_COLLECTION || "tenant_cellect_current",
     },
     allowedDomains,
   };
@@ -387,9 +390,9 @@ export async function searchQdrant(
     throw new Error("Qdrant search requires at least one explicit QMD collection");
   }
 
-  const grouped: Record<QdrantDomain, string[]> = { public: [], shape: [] };
+  const grouped: Record<QdrantDomain, string[]> = { public: [], shape: [], cellect: [] };
   for (const collection of collections) grouped[qdrantDomainForCollection(collection)].push(collection);
-  for (const domain of ["public", "shape"] as const) {
+  for (const domain of ["public", "shape", "cellect"] as const) {
     if (grouped[domain].length > 0 && !config.allowedDomains.has(domain)) {
       throw new Error(`Qdrant security domain is not allowed by this runtime: ${domain}`);
     }
@@ -415,7 +418,7 @@ export async function searchQdrant(
   // a large candidateLimit into a backend 400.
   const candidateLimit = Math.min(100, Math.max(options.limit, options.candidateLimit ?? 40));
   const domainResults = await Promise.all(
-    (["public", "shape"] as const)
+    (["public", "shape", "cellect"] as const)
       .filter(domain => grouped[domain].length > 0)
       .map(domain => queryDomain(
         config,

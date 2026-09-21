@@ -34,6 +34,13 @@ import {
   ScopedAuthError,
   verifyScopedSearchToken,
 } from "../scoped-auth.js";
+import {
+  authorizeQueryCollections,
+  loadQueryApiAuthConfig,
+  QueryApiAuthError,
+  queryApiBearerToken,
+  verifyQueryApiToken,
+} from "../query-auth.js";
 
 async function createServerStore(): Promise<QMDStore> {
   return createStore({
@@ -563,6 +570,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
   const store = await createServerStore();
   const host = options?.host ?? process.env.QMD_HOST ?? "localhost";
   const scopedSearchConfig = loadScopedSearchConfig();
+  const queryApiAuthConfig = loadQueryApiAuthConfig();
 
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();
@@ -757,6 +765,15 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         return;
       }
 
+      // When QMD is published to a network, the generic MCP protocol has no
+      // tenant-aware collection policy. Keep it unavailable rather than
+      // accidentally retaining a second caller-controlled search surface.
+      if (pathname === "/mcp" && queryApiAuthConfig) {
+        nodeRes.writeHead(404, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ error: "Not found" }));
+        return;
+      }
+
       // REST endpoint: POST /search — structured search without MCP protocol
       // REST endpoint: POST /query (alias: /search) — structured search without MCP protocol
       if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
@@ -806,10 +823,15 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           nodeRes.end(JSON.stringify({ error: "Invalid search parameters" }));
           return;
         }
-        if (isQdrantConfigured() && (!Array.isArray(params.collections) || params.collections.length === 0)) {
+        if ((isQdrantConfigured() || queryApiAuthConfig) && (!Array.isArray(params.collections) || params.collections.length === 0)) {
           nodeRes.writeHead(400, { "Content-Type": "application/json" });
           nodeRes.end(JSON.stringify({ error: "Qdrant-backed search requires explicit collections" }));
           return;
+        }
+
+        if (queryApiAuthConfig) {
+          const identity = verifyQueryApiToken(queryApiBearerToken(nodeReq.headers.authorization), queryApiAuthConfig);
+          authorizeQueryCollections(identity, params.collections ?? []);
         }
 
         // Map to internal format
@@ -941,9 +963,10 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
       nodeRes.writeHead(404);
       nodeRes.end("Not Found");
     } catch (err) {
-      if (err instanceof ScopedAuthError) {
-        nodeRes.writeHead(401, { "Content-Type": "application/json" });
-        nodeRes.end(JSON.stringify({ error: "Unauthorized" }));
+      if (err instanceof ScopedAuthError || err instanceof QueryApiAuthError) {
+        const status = err instanceof QueryApiAuthError ? err.status : 401;
+        nodeRes.writeHead(status, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ error: status === 403 ? "Forbidden" : "Unauthorized" }));
         log(`${ts()} scoped request rejected (${Date.now() - reqStart}ms)`);
         return;
       }

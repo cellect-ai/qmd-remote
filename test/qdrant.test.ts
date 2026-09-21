@@ -118,6 +118,7 @@ describe("Qdrant collection security domains", () => {
     ["shape_docusign", "shape"],
     ["wip", "shape"],
     ["rooms-shape-24-bright", "shape"],
+    ["cellect_docs", "cellect"],
   ])("maps %s to %s", (collection, domain) => {
     expect(qdrantDomainForCollection(collection)).toBe(domain);
   });
