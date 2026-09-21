@@ -41,7 +41,7 @@ import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "./metadata.j
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import { isQdrantConfigured } from "./qdrant.js";
 import { searchQdrantWithMetadata } from "./qdrant-search.js";
-import { getDefaultRemoteLLM, isRemoteConfigured } from "./llm-remote.js";
+import { getDefaultRemoteLLM, isRemoteConfigured, withRemoteLLMSession } from "./llm-remote.js";
 import type { LLM } from "./llm.js";
 import {
   initializeMetadataSchema,
@@ -1990,8 +1990,8 @@ export async function generateEmbeddings(
   options?: EmbedOptions
 ): Promise<EmbedResult> {
   const db = store.db;
-  const llm = getLlm(store);
-  const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
+  const useRemote = isRemoteConfigured();
+  const model = options?.model ?? (useRemote ? DEFAULT_EMBED_MODEL : getLlm(store).embedModelName ?? DEFAULT_EMBED_MODEL);
   const fingerprint = getEmbeddingFingerprint(model);
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
@@ -2014,7 +2014,7 @@ export async function generateEmbeddings(
   const embedModelUri = model;
 
   // Create a session manager for this llm instance
-  const result = await withLLMSessionForLlm(llm, async (session) => {
+  const runEmbedSession = async (session: ILLMSession) => {
     let chunksEmbedded = 0;
     let bytesProcessed = 0;
     let totalChunks = 0;
@@ -2236,7 +2236,12 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
+  };
+  const embedSessionOptions = { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' };
+  const result = useRemote
+    ? await withRemoteLLMSession(runEmbedSession, embedSessionOptions)
+    : await withLLMSessionForLlm(getLlm(store), runEmbedSession, embedSessionOptions);
+
 
   return {
     docsProcessed: totalDocs,
