@@ -5,7 +5,7 @@ Quick setup guide for installing QMD with remote LLM backend on a new server.
 ## Prerequisites
 
 - Linux or macOS
-- Network access to the QMD model server (192.168.5.163)
+- Network access to GPU embed/rerank on `cellect-gpu-docsvc` (`192.168.5.136`) and LiteLLM on `cellect-shared-services` (`192.168.5.139`)
 
 ## Installation
 
@@ -46,9 +46,9 @@ Set the remote model server endpoints:
 
 ```bash
 qmd remote set \
-  http://192.168.5.163:8081 \
-  http://192.168.5.163:8082 \
-  http://192.168.5.163:8083
+  http://192.168.5.136:8081 \
+  http://192.168.5.136:8082 \
+  http://192.168.5.139:4000
 
 # Verify configuration
 qmd remote status
@@ -60,9 +60,9 @@ qmd remote status
 # Point generate at LiteLLM (keep embed/rerank on llama.cpp servers)
 # Use the server IP, not localhost
 qmd remote set \
-  http://192.168.5.163:8081 \
-  http://192.168.5.163:8082 \
-  http://192.168.5.163:4000
+  http://192.168.5.136:8081 \
+  http://192.168.5.136:8082 \
+  http://192.168.5.139:4000
 
 # Set the fast model for expansion (required for LiteLLM)
 qmd remote set --generate-model fast
@@ -177,7 +177,7 @@ qmd where
 
 ```bash
 # Check network connectivity
-curl http://192.168.5.163:8081/health
+curl http://192.168.5.136:8081/health
 
 # Verify remote config
 qmd remote status
@@ -201,7 +201,7 @@ qmd collection list
 
 The remote server handles all model loading. If you see errors:
 
-1. Check that the model server is running: `curl http://192.168.5.163:8081/health`
+1. Check that the model server is running: `curl http://192.168.5.136:8081/health`
 2. Contact the server administrator
 3. Temporarily use local models: `qmd remote clear`
 
