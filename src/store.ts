@@ -2109,14 +2109,27 @@ export async function generateEmbeddings(
         if (!doc.body.trim()) continue;
 
         const title = extractTitle(doc.body, doc.path);
-        const chunks = await chunkDocumentByTokensWithLlm(
-          llm,
-          doc.body,
-          undefined, undefined, undefined,
-          doc.path,
-          options?.chunkStrategy,
-          session.signal,
-        );
+        const chunks = useRemote
+          ? (await chunkDocumentAsync(
+              doc.body,
+              CHUNK_SIZE_TOKENS * 3,
+              CHUNK_OVERLAP_TOKENS * 3,
+              CHUNK_WINDOW_TOKENS * 3,
+              doc.path,
+              options?.chunkStrategy,
+            )).map((chunk) => ({
+              text: chunk.text,
+              pos: chunk.pos,
+              tokens: Math.ceil(chunk.text.length / 3),
+            }))
+          : await chunkDocumentByTokensWithLlm(
+              getLlm(store),
+              doc.body,
+              undefined, undefined, undefined,
+              doc.path,
+              options?.chunkStrategy,
+              session.signal,
+            );
 
         for (let seq = 0; seq < chunks.length; seq++) {
           batchChunks.push({
