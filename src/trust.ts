@@ -10,7 +10,11 @@
  * - `models.embed` / `models.rerank` / `models.generate` — any `hf:` repo or
  *   local GGUF path (#889)
  *
- * Global `~/.config/qmd` is never gated. In-project collection paths and the
+ * Global `~/.config/qmd` is never gated, and neither is the config directory
+ * the deployment names with QMD_CONFIG_DIR: the operator chose it, as with the
+ * global config (the sidecar images set it to `/home/node/.qmd`). A directory
+ * picked on the CLI (--qmd-dir, a saved or mirrored one) is gated whatever it
+ * is called. In-project collection paths and the
  * built-in default model URIs are also allowed without approval: those are
  * what a local config is for. Approvals are per config file and per gated
  * set, recorded in `<config dir>/trusted.json`. Editing a hook, pointing a
@@ -85,6 +89,8 @@ export function isLocalConfigPath(configPath: string): boolean {
   // Pointed at explicitly (--qmd-dir, a saved or mirrored directory): somebody
   // else's config until approved, whatever the directory is called.
   if (chosenConfigPaths.has(path)) return true;
+  // Named by the deployment: the operator's own config, like the global one.
+  if (isEnvironmentConfigPath(path)) return false;
   return basename(dirname(path)) === ".qmd";
 }
 
@@ -93,6 +99,13 @@ const chosenConfigPaths = new Set<string>();
 /** Mark a config the CLI was pointed at, so the gate applies to it. */
 export function markChosenConfigPath(configPath: string): void {
   chosenConfigPaths.add(resolve(configPath));
+}
+
+/** True when the config lives in the directory QMD_CONFIG_DIR names. */
+export function isEnvironmentConfigPath(configPath: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  const configDir = env.QMD_CONFIG_DIR?.trim();
+  if (!configDir) return false;
+  return realOrResolve(dirname(resolve(configPath))) === realOrResolve(configDir);
 }
 
 /** Directory that contains the `.qmd` folder for a project-local config. */

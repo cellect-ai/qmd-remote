@@ -33,7 +33,7 @@ USER 1000:1000
 ENV HOME=/home/node
 ENV INDEX_PATH=/home/node/.qmd/index.sqlite
 ENV QMD_CONFIG_DIR=/home/node/.qmd
-# Keep execution independent of HOME's project discovery. The legacy .qmd
-# config additionally needs a one-time `qmd trust` approval for its exact
-# collection paths; do not globally disable upstream's trust gate.
+# Keep execution independent of HOME's project discovery. QMD_CONFIG_DIR is
+# the operator's choice, so its config is trusted like the global one and needs
+# no `qmd trust`; configs chosen on the CLI stay behind upstream's trust gate.
 WORKDIR /opt/qmd

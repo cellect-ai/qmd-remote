@@ -3,7 +3,9 @@
  *
  * A directory chosen with --qmd-dir, saved by `qmd init <path>`, written into
  * config.json by hand, or created by `qmd mirror` is somebody else's config
- * until approved, whatever the directory is called.
+ * until approved, whatever the directory is called. A config directory the
+ * deployment names with QMD_CONFIG_DIR is the operator's own, like the global
+ * config, and runs without `qmd trust`.
  */
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -122,5 +124,22 @@ describe("CLI-chosen, saved and mirrored config directories are gated", () => {
     const result = await run(["update", "--qmd-dir", dir]);
     expect(result.stdout).toContain("Running update command");
     expect(existsSync(marker)).toBe(true);
+  }, 120_000);
+});
+
+describe("a config directory selected by the deployment environment", () => {
+  test("QMD_CONFIG_DIR=<dir>/.qmd (central's image) indexes and runs hooks without qmd trust", async () => {
+    const dir = writeConfigDir(join(root, "node", ".qmd"));
+    const result = await run(["update"], { QMD_CONFIG_DIR: dir, INDEX_PATH: join(dir, "index.sqlite") }, join(root, "opt"));
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("qmd trust");
+    expect(result.stdout).toContain("Running update command");
+    expect(result.stdout).toContain("Indexed: 1 new");
+    expect(existsSync(marker)).toBe(true);
+  }, 120_000);
+
+  test("the same directory chosen with --qmd-dir is still gated", async () => {
+    const dir = writeConfigDir(join(root, "node", ".qmd"));
+    expectGated(await run(["update", "--qmd-dir", dir], { QMD_CONFIG_DIR: dir }));
   }, 120_000);
 });
