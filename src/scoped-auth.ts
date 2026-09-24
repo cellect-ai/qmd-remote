@@ -12,7 +12,14 @@ export type ScopedSearchClaims = {
 export type ScopedSearchConfig = {
   secret: Buffer;
   collections: string[];
+  /**
+   * QMD_SCOPED_TENANT: the only tenant this sidecar serves. One Rooms process
+   * holds every tenant's QMD secret, so a mis-routed token must still fail.
+   */
+  tenant?: string;
 };
+
+const TENANT_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
 export class ScopedAuthError extends Error {}
 
@@ -40,16 +47,20 @@ export function loadScopedSearchConfig(env: NodeJS.ProcessEnv = process.env): Sc
   const collections = [...new Set(
     (env.QMD_SCOPED_COLLECTIONS ?? "").split(",").map(value => value.trim()).filter(Boolean),
   )];
-  if (!secretFile && collections.length === 0) return null;
+  const tenant = env.QMD_SCOPED_TENANT?.trim() || undefined;
+  if (!secretFile && collections.length === 0 && !tenant) return null;
   if (!secretFile || collections.length === 0) {
     throw new Error("QMD_SCOPED_TOKEN_SECRET_FILE and QMD_SCOPED_COLLECTIONS must be configured together");
+  }
+  if (tenant !== undefined && !TENANT_PATTERN.test(tenant)) {
+    throw new Error("QMD_SCOPED_TENANT is invalid");
   }
   const secret = Buffer.from(readFileSync(secretFile, "utf8").trim(), "utf8");
   if (secret.length < 32) throw new Error("QMD scoped token secret must be at least 32 bytes");
   if (collections.length > 50 || collections.some(value => value.length > 200)) {
     throw new Error("QMD_SCOPED_COLLECTIONS is invalid");
   }
-  return { secret, collections };
+  return { secret, collections, ...(tenant ? { tenant } : {}) };
 }
 
 export function bearerToken(authorization: string | undefined): string {
@@ -80,6 +91,10 @@ export function verifyScopedSearchToken(
   if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
     throw new ScopedAuthError("Invalid scoped token signature");
   }
+  // A key id, when present, names the tenant whose key signed the token.
+  if (config.tenant !== undefined && header.kid !== undefined && header.kid !== config.tenant) {
+    throw new ScopedAuthError("Scoped token key is for another tenant");
+  }
 
   const audience = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
   const issuedAt = Number(payload.iat);
@@ -98,8 +113,11 @@ export function verifyScopedSearchToken(
   if (typeof payload.sub !== "string" || payload.sub.length < 1 || payload.sub.length > 200) {
     throw new ScopedAuthError("Scoped token subject is invalid");
   }
-  if (typeof payload.tenant !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(payload.tenant)) {
+  if (typeof payload.tenant !== "string" || !TENANT_PATTERN.test(payload.tenant)) {
     throw new ScopedAuthError("Scoped token tenant is invalid");
+  }
+  if (config.tenant !== undefined && payload.tenant !== config.tenant) {
+    throw new ScopedAuthError("Scoped token is for another tenant");
   }
   const scopes = stringArray(payload.scopes, "scopes", 100);
   if (scopes.some(scope => !/^(project|company|fund|data-room):[^:*?]+$/.test(scope))) {
