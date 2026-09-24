@@ -98,6 +98,7 @@ import {
   type OutputFormat,
 } from "./formatter.js";
 import { resolveCommit } from "./version.js";
+import { loadMirrorConfig, saveMirrorConfig, clearMirrorConfig, syncMirror, isMirrorStale, mirrorAgeString, type MirrorConfig } from "../mirror.js";
 import {
   getCollection as getCollectionFromYaml,
   listCollections as yamlListCollections,
@@ -3597,6 +3598,12 @@ function showHelp(): void {
   console.log("  - `qmd --skill` is kept as an alias for `qmd skill show`.");
   console.log("  - Advanced: `qmd mcp --http ...` and `qmd mcp --http --daemon` are optional for custom transports.");
   console.log("");
+  console.log("Mirror (cached local copies of remote indexes):");
+  console.log("  qmd mirror <ssh-src> [path]   - Set up local cache of remote .qmd index");
+  console.log("  qmd mirror sync               - Re-sync from recorded source");
+  console.log("  qmd mirror status             - Show mirror source, last sync, staleness");
+  console.log("  qmd mirror clear              - Remove mirror tracking (keep local copy)");
+  console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
   console.log("  QMD_EDITOR_URI             - Editor link template for clickable TTY search output");
@@ -4860,6 +4867,124 @@ if (isMain) {
           console.error("Run 'qmd skill help' for usage");
           printDoctorHint();
           process.exit(1);
+      }
+      break;
+    }
+
+    case "mirror": {
+      const sub = cli.args[0];
+      // The fork resolved the mirror through a saved global .qmd directory;
+      // this lineage uses project-local .qmd discovery, so find the nearest
+      // mirror above the working directory instead.
+      const findMirrorDir = (): string | null => {
+        let dir = pathResolve(getPwd());
+        while (true) {
+          const candidate = pathJoin(dir, ".qmd");
+          if (existsSync(pathJoin(candidate, ".mirror.json"))) return candidate;
+          const parent = dirname(dir);
+          if (parent === dir) return null;
+          dir = parent;
+        }
+      };
+
+      // ── mirror status (no args, or explicit "status") ─────────────────────
+      if (!sub || sub === "status") {
+        const qmdDir = findMirrorDir();
+        const mirror = qmdDir ? loadMirrorConfig(qmdDir) : null;
+        if (!mirror) {
+          console.log(`${c.dim}No mirror configured for this directory.${c.reset}`);
+          console.log(`${c.dim}Run 'qmd mirror <user@host:/path/.qmd>' to set one up.${c.reset}`);
+        } else {
+          const stale = isMirrorStale(mirror);
+          console.log(`${c.bold}Mirror Status${c.reset}\n`);
+          console.log(`${c.dim}Source:${c.reset}    ${mirror.source}`);
+          console.log(`${c.dim}Local:${c.reset}     ${mirror.localPath}`);
+          console.log(`${c.dim}Last sync:${c.reset} ${mirror.lastSync ? `${mirror.lastSync} (${mirrorAgeString(mirror)})` : "never"}`);
+          console.log(`${c.dim}Status:${c.reset}    ${stale ? `${c.yellow}stale — run 'qmd mirror sync'${c.reset}` : `${c.green}fresh${c.reset}`}`);
+        }
+        break;
+      }
+
+      // ── mirror sync ────────────────────────────────────────────────────────
+      if (sub === "sync") {
+        const qmdDir = findMirrorDir();
+        const mirror = qmdDir ? loadMirrorConfig(qmdDir) : null;
+        if (!qmdDir || !mirror) {
+          console.error("No mirror configured. Run 'qmd mirror <user@host:/path/.qmd>' first.");
+          process.exit(1);
+        }
+        console.log(`Syncing from ${c.bold}${mirror.source}${c.reset} ...`);
+        try {
+          await syncMirror(qmdDir, mirror, {
+            onProgress: (line) => process.stderr.write(line),
+          });
+          console.log(`${c.green}✓${c.reset} Sync complete (${mirror.lastSync})`);
+        } catch (e: any) {
+          console.error(`${c.yellow}✗${c.reset} Sync failed: ${e.message}`);
+          process.exit(1);
+        }
+        break;
+      }
+
+      // ── mirror clear ───────────────────────────────────────────────────────
+      if (sub === "clear") {
+        const qmdDir = findMirrorDir();
+        if (!qmdDir) {
+          console.error("No mirror configured.");
+          process.exit(1);
+        }
+        clearMirrorConfig(qmdDir);
+        console.log(`${c.green}✓${c.reset} Mirror tracking removed (local copy kept)`);
+        break;
+      }
+
+      // ── mirror <ssh-source> [local-path] ───────────────────────────────────
+      {
+        const source = sub;
+        const localArg = cli.args[1];
+
+        // Derive a default local path from the source if not given
+        // e.g. ~/.cache/qmd/mirrors/shape-main/.qmd
+        let localPath: string;
+        if (localArg) {
+          localPath = pathResolve(localArg);
+          // If given a parent dir (not ending in .qmd), append .qmd
+          if (!localPath.endsWith(".qmd")) {
+            localPath = pathResolve(localPath, ".qmd");
+          }
+        } else {
+          // Slug from last component of source path (strip .qmd suffix for readability)
+          const srcPath = source.includes(":") ? source.split(":")[1]! : source;
+          const parts = srcPath.replace(/\/\.qmd\/?$/, "").split("/").filter(Boolean);
+          const slug = parts[parts.length - 1] || "mirror";
+          localPath = pathResolve(homedir(), ".cache", "qmd", "mirrors", slug, ".qmd");
+        }
+
+        mkdirSync(localPath, { recursive: true });
+
+        const mirrorConfig: MirrorConfig = {
+          source,
+          localPath,
+          lastSync: null,
+        };
+
+        // Save tracking file before sync so it's in place
+        saveMirrorConfig(localPath, mirrorConfig);
+
+        // Do initial sync
+        console.log(`Syncing ${c.bold}${source}${c.reset} → ${localPath} ...`);
+        console.log(`${c.dim}(this may take a while on first run)${c.reset}`);
+        try {
+          await syncMirror(localPath, mirrorConfig, {
+            onProgress: (line) => process.stderr.write(line),
+          });
+        } catch (e: any) {
+          console.error(`${c.yellow}✗${c.reset} Sync failed: ${e.message}`);
+          process.exit(1);
+        }
+
+        console.log(`${c.green}✓${c.reset} Mirror ready at ${localPath}`);
+        console.log(`${c.dim}Use it from ${dirname(localPath)} (project-local .qmd). Its config came from the remote host: review it and run 'qmd trust' there before relying on its hooks, paths or models. Run 'qmd mirror sync' to refresh.${c.reset}`);
       }
       break;
     }

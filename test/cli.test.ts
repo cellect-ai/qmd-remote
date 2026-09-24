@@ -1326,6 +1326,34 @@ ${token}
   });
 });
 
+describe("CLI Mirror Command", () => {
+  test("sets up, reports and clears a mirror using rsync from PATH", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("mirror");
+    const binDir = join(testDir, `mirror-bin-${Date.now()}`);
+    await mkdir(binDir, { recursive: true });
+    // Stub rsync: copy a canned index.yml into the destination (last argument).
+    await writeFile(join(binDir, "rsync"), '#!/bin/sh\nfor last; do :; done\nprintf "collections: {}\\n" > "${last}index.yml"\n');
+    await chmod(join(binDir, "rsync"), 0o755);
+    const env = { PATH: `${binDir}:${process.env.PATH}` };
+    const parent = join(testDir, `mirror-local-${Date.now()}`);
+
+    const setup = await runQmd(["mirror", "gpu:/srv/agent/.qmd", parent], { dbPath, configDir, env });
+    expect(setup.exitCode).toBe(0);
+    expect(setup.stdout).toContain(`Mirror ready at ${join(parent, ".qmd")}`);
+    expect(existsSync(join(parent, ".qmd", "index.yml"))).toBe(true);
+
+    const status = await runQmd(["mirror", "status"], { dbPath, configDir, env, cwd: parent });
+    expect(status.exitCode).toBe(0);
+    expect(status.stdout).toContain("gpu:/srv/agent/.qmd");
+    expect(status.stdout).toContain("fresh");
+
+    const clear = await runQmd(["mirror", "clear"], { dbPath, configDir, env, cwd: parent });
+    expect(clear.exitCode).toBe(0);
+    const after = await runQmd(["mirror", "status"], { dbPath, configDir, env, cwd: parent });
+    expect(after.stdout).toContain("No mirror configured");
+  });
+});
+
 describe("CLI Add-Context Command", () => {
   let localDbPath: string;
   let localConfigDir: string;
