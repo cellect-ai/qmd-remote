@@ -111,11 +111,65 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (embedDocFormat() === "cleaned") return formatCleanedDocForEmbedding(text, title, uri);
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
   }
   return `title: ${title || "none"} | text: ${text}`;
+}
+
+const MAX_EMBED_CHARS = 1500;
+
+/**
+ * Document embedding text format. `raw` is upstream's format, which the Rooms
+ * sidecars were indexed with. `cleaned` is the fork format that central QMD
+ * (the pre-reconciliation `main` lineage) indexed with: markdown artifacts
+ * stripped, whitespace collapsed, title capped at 150 chars and the whole
+ * text capped at MAX_EMBED_CHARS. Existing vectors are only consistent with
+ * the format they were built with, so each deployment must keep its own.
+ */
+export function embedDocFormat(env: NodeJS.ProcessEnv = process.env): "raw" | "cleaned" {
+  const value = env.QMD_EMBED_DOC_FORMAT?.trim();
+  if (!value || value === "raw") return "raw";
+  if (value === "cleaned") return "cleaned";
+  throw new Error("QMD_EMBED_DOC_FORMAT must be raw or cleaned");
+}
+
+function formatCleanedDocForEmbedding(text: string, title: string | undefined, uri: string): string {
+  // Clean markdown artifacts that cause poor tokenization
+  const cleaned = text
+    .replace(/\\_+/g, '')                           // Remove escaped underscores
+    .replace(/\|[-:]+\|/g, '')                       // Remove table separators
+    .replace(/<br\s*\/?>/g, ' ')                     // Remove <br> tags
+    .split('\n').map(line => {
+      if (line.includes('|')) {
+        // Extract content from tables, skip line numbers
+        return line.split('|')
+          .map(c => c.trim())
+          .filter(c => c && !/^\d+$/.test(c))
+          .join(' ');
+      }
+      return line;
+    }).join('\n')
+    .replace(/\s+/g, ' ')                            // Collapse whitespace
+    .trim();
+
+  // Truncate title to prevent token overflow (some docs have massive titles)
+  const truncatedTitle = title && title.length > 150 ? title.slice(0, 150) + "..." : (title || "none");
+
+  if (isQwen3EmbeddingModel(uri)) {
+    // Qwen3-Embedding: documents are raw text, no task prefix
+    const prefix = title ? `${truncatedTitle}\n` : "";
+    const availableChars = Math.max(0, MAX_EMBED_CHARS - prefix.length);
+    const truncatedText = cleaned.length > availableChars ? cleaned.slice(0, availableChars) : cleaned;
+    return `${prefix}${truncatedText}`;
+  }
+
+  const prefix = `title: ${truncatedTitle} | text: `;
+  const availableChars = Math.max(0, MAX_EMBED_CHARS - prefix.length);
+  const truncatedText = cleaned.length > availableChars ? cleaned.slice(0, availableChars) : cleaned;
+  return `${prefix}${truncatedText}`;
 }
 
 // =============================================================================

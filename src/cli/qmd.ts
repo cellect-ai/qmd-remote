@@ -904,7 +904,7 @@ function manageTrust(subcommand?: string): void {
   console.log(`${c.dim}Editing a hook, out-of-project path, or custom model will ask again. Revoke with 'qmd trust revoke'.${c.reset}`);
 }
 
-async function updateCollections(): Promise<void> {
+async function updateCollections(fullCheck: boolean = false): Promise<void> {
   // Prompt before opening the store so an approval is visible to getStore (#889).
   const allowed = await resolveLocalConfigTrust();
 
@@ -984,6 +984,8 @@ async function updateCollections(): Promise<void> {
 
     const result = await reindexCollection(storeInstance, col.pwd, col.glob_pattern, col.name, {
       ignorePatterns: yamlCol?.ignore,
+      // Opt-in: skip reading files whose mtime is unchanged. --full re-reads all.
+      incremental: !fullCheck && process.env.QMD_UPDATE_INCREMENTAL === "1",
       onProgress: (info) => {
         progress.set((info.current / info.total) * 100);
         const elapsed = (Date.now() - startTime) / 1000;
@@ -1919,8 +1921,6 @@ function collectionRename(oldName: string, newName: string): void {
 async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[]): Promise<void> {
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
-  const now = new Date().toISOString();
-  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
 
   // Clear Ollama cache on index
   clearCache(db);
@@ -1933,142 +1933,29 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
   progress.indeterminate();
-  const allIgnore = [
-    ...excludeDirs.map(d => `**/${d}/**`),
-    ...(ignorePatterns || []),
-  ];
-  const allFiles: string[] = await fastGlob(splitGlobMask(globPattern), {
-    cwd: resolvedPwd,
-    onlyFiles: true,
-    followSymbolicLinks: false,
-    dot: false,
-    ignore: allIgnore,
-  });
-  // Filter hidden files/folders (dot: false handles top-level but not nested)
-  const files = allFiles.filter(file => {
-    const parts = file.split("/");
-    return !parts.some(part => part.startsWith("."));
-  });
-
-  const total = files.length;
-  const hasNoFiles = total === 0;
-  if (hasNoFiles) {
-    progress.clear();
-    console.log("No files found matching pattern.");
-    // Continue so the deactivation pass can mark previously indexed docs as inactive.
-  }
-
-  let indexed = 0, updated = 0, unchanged = 0, processed = 0, metadataErrors = 0;
-  const skippedFiles: { file: string; code: string }[] = [];
-  const seenPaths = new Set<string>();
-  // Literal paths of every file in this scan. Passed to the legacy-path
-  // migration so it never adopts a row that still belongs to a live file.
-  const livePaths = new Set(files.map(f => f.replace(/\\/g, '/')));
   const startTime = Date.now();
-
-  for (const relativeFile of files) {
-    const filepath = getRealPath(resolve(resolvedPwd, relativeFile));
-    // Store the literal relative path — handelize() is NOT applied at index time.
-    const path = relativeFile.replace(/\\/g, '/');
-    if (!isPathInsideDir(resolvedPwd, filepath)) {
-      processed++;
-      skippedFiles.push({ file: relativeFile, code: "OUTSIDE_COLLECTION" });
-      progress.set((processed / total) * 100);
-      continue;
-    }
-    seenPaths.add(path);
-
-    let content: string;
-    try {
-      content = readFileSync(filepath, "utf-8");
-    } catch (err) {
-      // Skip files that can't be read (ETIMEDOUT, EAGAIN, EACCES, …) (#460)
-      processed++;
-      skippedFiles.push({ file: relativeFile, code: fsErrorCode(err) });
-      progress.set((processed / total) * 100);
-      continue;
-    }
-
-    // Skip empty files - nothing useful to index
-    if (!content.trim()) {
-      processed++;
-      continue;
-    }
-
-    const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
-
-    // Check if document exists (also migrates legacy lowercase paths)
-    const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
-
-    let documentId: number;
-    let contentChanged = true;
-
-    if (existing) {
-      documentId = existing.id;
-      if (existing.hash === hash) {
-        contentChanged = false;
-        // Hash unchanged, but check if title needs updating
-        if (existing.title !== title) {
-          updateDocumentTitle(db, existing.id, title, now);
-          updated++;
-        } else {
-          unchanged++;
-        }
-      } else {
-        // Content changed - insert new content hash and update document
-        insertContent(db, hash, content, now);
-        const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
-        updated++;
-      }
-    } else {
-      // New document - insert content and document
-      indexed++;
-      insertContent(db, hash, content, now);
-      const stat = statSync(filepath);
-      documentId = insertDocument(db, collectionName, path, title, hash,
-        stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
-    }
-
-    // Unchanged content still backfills missing or stale extraction state.
-    const extraction = syncDocumentMetadata(db, documentId, content, path,
-      contentChanged ? undefined : { onlyIfStale: true });
-    if (extraction?.error) metadataErrors++;
-
-    processed++;
-    progress.set((processed / total) * 100);
-    const elapsed = (Date.now() - startTime) / 1000;
-    const rate = processed / elapsed;
-    const remaining = (total - processed) / rate;
-    const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
-    if (isTTY) process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
-  }
-
-  // Deactivate documents in this collection that no longer exist
-  const allActive = getActiveDocumentPaths(db, collectionName);
-  let removed = 0;
-  for (const path of allActive) {
-    if (!seenPaths.has(path)) {
-      deactivateDocument(db, collectionName, path);
-      removed++;
-    }
-  }
-
-  // Clean up orphaned content hashes (content not referenced by any document)
-  const orphanedContent = cleanupOrphanedContent(db);
+  // Same pass as `qmd update`, including its per-file I/O timeouts.
+  const result = await reindexCollection(getStore(), resolvedPwd, globPattern, collectionName, {
+    ignorePatterns,
+    onProgress: (info) => {
+      progress.set((info.current / info.total) * 100);
+      const elapsed = (Date.now() - startTime) / 1000;
+      const rate = info.current / elapsed;
+      const remaining = (info.total - info.current) / rate;
+      const eta = info.current > 2 ? ` ETA: ${formatETA(remaining)}` : "";
+      if (isTTY) process.stderr.write(`\rIndexing: ${info.current}/${info.total}${eta}        `);
+    },
+  });
 
   // Check if vector index needs updating
   const needsEmbedding = getHashesNeedingEmbedding(db);
 
   progress.clear();
-  console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
-  reportSkippedReads(skippedFiles);
-  reportMetadataErrors(metadataErrors);
-  if (orphanedContent > 0) {
-    console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
+  console.log(`\nIndexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
+  reportSkippedReads(result.skippedFiles);
+  reportMetadataErrors(result.metadataErrors);
+  if (result.orphanedCleaned > 0) {
+    console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
   }
 
   if (needsEmbedding > 0 && !suppressEmbedNotice) {
@@ -2107,7 +1994,7 @@ function reportSkippedReads(skippedFiles: { file: string; code: string }[]): voi
 }
 
 function renderProgressBar(percent: number, width: number = 30): string {
-  const filled = Math.round((percent / 100) * width);
+  const filled = Math.min(Math.round((percent / 100) * width), width);
   const empty = width - filled;
   const bar = "█".repeat(filled) + "░".repeat(empty);
   return bar;
@@ -3658,7 +3545,8 @@ function showHelp(): void {
   console.log("Maintenance:");
   console.log("  qmd init                      - Create a project-local .qmd index");
   console.log("  qmd status                    - View index + collection health");
-  console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
+  console.log("  qmd update [--pull] [--full]  - Re-index collections (optionally git pull first)");
+  console.log("    QMD_UPDATE_INCREMENTAL=1    - Skip files whose mtime is unchanged; --full re-reads all");
   console.log("  qmd trust [list|revoke]       - Approve a checked-in .qmd config's hooks/paths/models");
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
@@ -4695,7 +4583,7 @@ if (isMain) {
       break;
 
     case "update":
-      await updateCollections();
+      await updateCollections(!!cli.values.full);
       break;
 
     case "trust":

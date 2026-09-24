@@ -15,7 +15,8 @@ import { openDatabase, loadSqliteVec } from "./db.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
-import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
+import { readFileSync, realpathSync, statSync, mkdirSync, type Stats } from "node:fs";
+import { readFile as fsReadFile, stat as fsStat } from "node:fs/promises";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
 import { qmdHomedir } from "./paths.js";
@@ -24,6 +25,7 @@ import {
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  embedDocFormat,
   withLLMSessionForLlm,
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
@@ -46,6 +48,7 @@ import type { LLM } from "./llm.js";
 import {
   initializeMetadataSchema,
   syncDocumentMetadata,
+  isDocumentMetadataCurrent,
   countDocumentsPendingMetadata,
   getMetadataByFilepath,
   parseMetadataJson,
@@ -131,6 +134,9 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
     `doc:${formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model)}`,
     `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
     `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
+    // The cleaned fork format leaves the probe text unchanged, so name it
+    // explicitly. The raw format keeps the fingerprint it always had.
+    ...(embedDocFormat() === "cleaned" ? ["doc_format:cleaned"] : []),
   ].join("\n");
   return createHash("sha256").update(significant).digest("hex").slice(0, 6);
 }
@@ -1583,6 +1589,22 @@ export type Store = {
 // Reindex & Embed — pure-logic functions for SDK and CLI
 // =============================================================================
 
+/** Per-file stat/read budget, so one stalled NFS handle cannot hang a pass. */
+const FILE_IO_TIMEOUT_MS = 10_000;
+
+function withFileIoTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(Object.assign(new Error(`Timeout after ${FILE_IO_TIMEOUT_MS}ms: ${label}`), { code: "ETIMEDOUT" })),
+      FILE_IO_TIMEOUT_MS,
+    );
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
 function fsErrorCode(err: unknown): string {
   if (err && typeof err === "object" && "code" in err) {
     const code = (err as { code: unknown }).code;
@@ -1626,6 +1648,13 @@ export async function reindexCollection(
   options?: {
     ignorePatterns?: string[];
     onProgress?: (info: ReindexProgress) => void;
+    /**
+     * Skip reading a known file whose mtime is not newer than the indexed
+     * row (and whose metadata extraction is current), and apply the whole
+     * pass in one transaction. Built for large NFS collections; `--full`
+     * turns it off.
+     */
+    incremental?: boolean;
   }
 ): Promise<ReindexResult> {
   const db = store.db;
@@ -1656,98 +1685,124 @@ export async function reindexCollection(
   // Literal paths of every file in this scan. Passed to the legacy-path
   // migration so it never adopts a row that still belongs to a live file.
   const livePaths = new Set(files.map(f => normalizePathSeparators(f)));
+  const incremental = options?.incremental === true;
 
-  for (const relativeFile of files) {
-    const filepath = getRealPath(resolve(collectionPath, relativeFile));
-    // Store the literal relative path so the filesystem path can always be
-    // reconstructed as: resolve(collection.path, storedPath).
-    // handelize() is NOT applied at index time — it is display-only.
-    const path = normalizePathSeparators(relativeFile);
-    // Glob `../` segments, absolute patterns, and file symlinks can resolve
-    // outside the collection root. Do not ingest those files, and do not mark
-    // them seen so a previous escaped row is deactivated on this pass.
-    if (!isPathInsideDir(collectionPath, filepath)) {
-      processed++;
-      skippedFiles.push({ file: relativeFile, code: "OUTSIDE_COLLECTION" });
-      options?.onProgress?.({ file: relativeFile, current: processed, total });
-      continue;
-    }
-    seenPaths.add(path);
+  // One transaction for the whole pass avoids a sync per row on NFS.
+  if (incremental) db.exec("BEGIN");
+  try {
+    for (const relativeFile of files) {
+      const filepath = getRealPath(resolve(collectionPath, relativeFile));
+      // Store the literal relative path so the filesystem path can always be
+      // reconstructed as: resolve(collection.path, storedPath).
+      // handelize() is NOT applied at index time — it is display-only.
+      const path = normalizePathSeparators(relativeFile);
+      // Glob `../` segments, absolute patterns, and file symlinks can resolve
+      // outside the collection root. Do not ingest those files, and do not mark
+      // them seen so a previous escaped row is deactivated on this pass.
+      if (!isPathInsideDir(collectionPath, filepath)) {
+        processed++;
+        skippedFiles.push({ file: relativeFile, code: "OUTSIDE_COLLECTION" });
+        options?.onProgress?.({ file: relativeFile, current: processed, total });
+        continue;
+      }
+      seenPaths.add(path);
 
-    let content: string;
-    try {
-      content = readFileSync(filepath, "utf-8");
-    } catch (err) {
-      // Skip files that can't be read (ETIMEDOUT on APFS compressed files,
-      // EAGAIN on iCloud evicted files, EACCES, etc.) instead of aborting
-      // the rest of the collection (#460).
-      processed++;
-      skippedFiles.push({ file: relativeFile, code: fsErrorCode(err) });
-      options?.onProgress?.({ file: relativeFile, current: processed, total });
-      continue;
-    }
+      // Look the row up first so an unchanged file need not be read at all.
+      const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
 
-    if (!content.trim()) {
-      processed++;
-      continue;
-    }
+      let content: string;
+      let stat: Stats;
+      try {
+        stat = await withFileIoTimeout(fsStat(filepath), `stat ${relativeFile}`);
+        // Skip empty files without reading them.
+        if (stat.size === 0) {
+          processed++;
+          continue;
+        }
+        if (incremental && existing) {
+          const indexedAt = (db.prepare(`SELECT modified_at FROM documents WHERE id = ?`)
+            .get(existing.id) as { modified_at: string } | undefined)?.modified_at;
+          if (indexedAt && new Date(stat.mtime).toISOString() <= indexedAt && isDocumentMetadataCurrent(db, existing.id)) {
+            unchanged++;
+            processed++;
+            options?.onProgress?.({ file: relativeFile, current: processed, total });
+            continue;
+          }
+        }
+        content = await withFileIoTimeout(fsReadFile(filepath, "utf-8"), `read ${relativeFile}`);
+      } catch (err) {
+        // Skip files that can't be read (ETIMEDOUT on APFS compressed files,
+        // EAGAIN on iCloud evicted files, EACCES, a stalled NFS handle, etc.)
+        // instead of aborting the rest of the collection (#460).
+        processed++;
+        skippedFiles.push({ file: relativeFile, code: fsErrorCode(err) });
+        options?.onProgress?.({ file: relativeFile, current: processed, total });
+        continue;
+      }
 
-    const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
+      if (!content.trim()) {
+        processed++;
+        continue;
+      }
 
-    const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
+      const hash = await hashContent(content);
+      const title = extractTitle(content, relativeFile);
 
-    let documentId: number;
-    let contentChanged = true;
+      let documentId: number;
+      let contentChanged = true;
 
-    if (existing) {
-      documentId = existing.id;
-      if (existing.hash === hash) {
-        contentChanged = false;
-        if (existing.title !== title) {
-          updateDocumentTitle(db, existing.id, title, now);
-          updated++;
+      if (existing) {
+        documentId = existing.id;
+        if (existing.hash === hash) {
+          contentChanged = false;
+          if (existing.title !== title) {
+            updateDocumentTitle(db, existing.id, title, now);
+            updated++;
+          } else {
+            unchanged++;
+          }
         } else {
-          unchanged++;
+          insertContent(db, hash, content, now);
+          updateDocument(db, existing.id, title, hash, new Date(stat.mtime).toISOString());
+          updated++;
         }
       } else {
+        indexed++;
         insertContent(db, hash, content, now);
-        const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
-        updated++;
+        documentId = insertDocument(db, collectionName, path, title, hash,
+          new Date(stat.birthtime).toISOString(),
+          new Date(stat.mtime).toISOString());
       }
-    } else {
-      indexed++;
-      insertContent(db, hash, content, now);
-      const stat = statSync(filepath);
-      documentId = insertDocument(db, collectionName, path, title, hash,
-        stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
+
+      // Unchanged content still backfills missing or stale extraction state.
+      const extraction = syncDocumentMetadata(db, documentId, content, path,
+        contentChanged ? undefined : { onlyIfStale: true });
+      if (extraction?.error) metadataErrors++;
+
+      processed++;
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
     }
 
-    // Unchanged content still backfills missing or stale extraction state.
-    const extraction = syncDocumentMetadata(db, documentId, content, path,
-      contentChanged ? undefined : { onlyIfStale: true });
-    if (extraction?.error) metadataErrors++;
-
-    processed++;
-    options?.onProgress?.({ file: relativeFile, current: processed, total });
-  }
-
-  // Deactivate documents that no longer exist
-  const allActive = getActiveDocumentPaths(db, collectionName);
-  let removed = 0;
-  for (const path of allActive) {
-    if (!seenPaths.has(path)) {
-      deactivateDocument(db, collectionName, path);
-      removed++;
+    // Deactivate documents that no longer exist
+    const allActive = getActiveDocumentPaths(db, collectionName);
+    let removed = 0;
+    for (const path of allActive) {
+      if (!seenPaths.has(path)) {
+        deactivateDocument(db, collectionName, path);
+        removed++;
+      }
     }
+
+    const orphanedCleaned = cleanupOrphanedContent(db);
+    if (incremental) db.exec("COMMIT");
+
+    return { indexed, updated, unchanged, removed, orphanedCleaned, skipped: skippedFiles.length, skippedFiles, metadataErrors };
+  } catch (err) {
+    if (incremental) {
+      try { db.exec("ROLLBACK"); } catch { /* already closed by SQLite */ }
+    }
+    throw err;
   }
-
-  const orphanedCleaned = cleanupOrphanedContent(db);
-
-  return { indexed, updated, unchanged, removed, orphanedCleaned, skipped: skippedFiles.length, skippedFiles, metadataErrors };
 }
 
 export type EmbedFailure = {

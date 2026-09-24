@@ -6,7 +6,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { chmod, copyFile, mkdtemp, rm, writeFile, mkdir } from "fs/promises";
+import { chmod, copyFile, mkdtemp, rm, writeFile, mkdir, utimes } from "fs/promises";
 import { existsSync, lstatSync, readFileSync, symlinkSync, writeFileSync, unlinkSync } from "fs";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
@@ -1297,6 +1297,32 @@ ${token}
 
     const after = await runQmd(["get", "qmd://empty-check/only.md"], { dbPath, configDir });
     expect(after.exitCode).toBe(1);
+  });
+
+  test("QMD_UPDATE_INCREMENTAL skips unchanged mtimes and --full re-reads them", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("update-incremental");
+    const collectionDir = join(testDir, `update-incremental-${Date.now()}`);
+    await mkdir(collectionDir, { recursive: true });
+    const docPath = join(collectionDir, "doc.md");
+    await writeFile(docPath, "# Doc\n\nfirst-version\n");
+    const add = await runQmd(["collection", "add", collectionDir, "--name", "incr"], { dbPath, configDir });
+    expect(add.exitCode).toBe(0);
+
+    // Change the content but keep an mtime no newer than the indexed one.
+    const past = new Date(Date.now() - 3_600_000);
+    await writeFile(docPath, "# Doc\n\nsecond-version\n");
+    await utimes(docPath, past, past);
+    const env = { QMD_UPDATE_INCREMENTAL: "1" };
+
+    const incremental = await runQmd(["update"], { dbPath, configDir, env });
+    expect(incremental.exitCode).toBe(0);
+    expect(incremental.stdout).toContain("0 new, 0 updated, 1 unchanged, 0 removed");
+    expect((await runQmd(["get", "qmd://incr/doc.md"], { dbPath, configDir })).stdout).toContain("first-version");
+
+    const full = await runQmd(["update", "--full"], { dbPath, configDir, env });
+    expect(full.exitCode).toBe(0);
+    expect(full.stdout).toContain("0 new, 1 updated, 0 unchanged, 0 removed");
+    expect((await runQmd(["get", "qmd://incr/doc.md"], { dbPath, configDir })).stdout).toContain("second-version");
   });
 });
 
