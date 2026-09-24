@@ -223,6 +223,20 @@ describe("identity-authenticated central endpoint", () => {
     expect(qdrantCalls).toHaveLength(0);
   });
 
+  test("authenticates before reading or validating the body", async () => {
+    const raw = (body: string, bearer?: string) => fetch(`${base}/query`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(bearer ? { authorization: `Bearer ${bearer}` } : {}) },
+      body,
+    });
+    expect((await raw("{not json")).status).toBe(401);
+    expect((await raw(JSON.stringify({ searches: [] }))).status).toBe(401);
+    expect((await raw("x".repeat(2_000_000))).status).toBe(401);
+    expect((await raw("{not json", "wrong-token")).status).toBe(401);
+    // An authenticated caller still gets the usual validation errors.
+    expect((await raw("{not json", token)).status).toBe(400);
+  });
+
   test("collections are mandatory, parameters are bounded, and /mcp is closed", async () => {
     expect((await query(lex, token)).status).toBe(400);
     expect((await query({ searches: [{ type: "lex", query: "x".repeat(5000) }], collections: ["cellect_docs"] }, token)).status).toBe(400);

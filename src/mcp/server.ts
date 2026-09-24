@@ -1172,6 +1172,11 @@ export async function startMcpHttpServer(
       // REST endpoint: POST /search — structured search without MCP protocol
       // REST endpoint: POST /query (alias: /search) — structured search without MCP protocol
       if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
+        // Authenticate before reading the body, so an anonymous caller learns
+        // nothing from validation errors and cannot make us buffer a payload.
+        const identity = queryApiAuthConfig
+          ? verifyQueryApiToken(queryApiBearerToken(nodeReq.headers.authorization), queryApiAuthConfig)
+          : null;
         const rawBody = await collectBody(nodeReq);
         let parsedParams: unknown;
         try {
@@ -1237,8 +1242,7 @@ export async function startMcpHttpServer(
           return;
         }
 
-        if (queryApiAuthConfig) {
-          const identity = verifyQueryApiToken(queryApiBearerToken(nodeReq.headers.authorization), queryApiAuthConfig);
+        if (identity) {
           authorizeQueryCollections(identity, (params.collections as string[] | undefined) ?? []);
         }
 
