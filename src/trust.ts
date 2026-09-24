@@ -81,7 +81,18 @@ export function getTrustFilePath(): string {
  */
 export function isLocalConfigPath(configPath: string): boolean {
   if (!configPath || configPath === "<inline>") return false;
-  return basename(dirname(resolve(configPath))) === ".qmd";
+  const path = resolve(configPath);
+  // Pointed at explicitly (--qmd-dir, a saved or mirrored directory): somebody
+  // else's config until approved, whatever the directory is called.
+  if (chosenConfigPaths.has(path)) return true;
+  return basename(dirname(path)) === ".qmd";
+}
+
+const chosenConfigPaths = new Set<string>();
+
+/** Mark a config the CLI was pointed at, so the gate applies to it. */
+export function markChosenConfigPath(configPath: string): void {
+  chosenConfigPaths.add(resolve(configPath));
 }
 
 /** Directory that contains the `.qmd` folder for a project-local config. */

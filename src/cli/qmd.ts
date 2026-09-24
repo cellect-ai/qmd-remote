@@ -129,6 +129,7 @@ import {
   isLocalConfigPath,
   isLocalConfigTrustOptedIn,
   isTrusted,
+  markChosenConfigPath,
   listTrusted,
   recordTrust,
   revokeTrust,
@@ -3111,6 +3112,7 @@ function parseCLI() {
     cliQmdDirFlag = typeof values["qmd-dir"] === "string" ? values["qmd-dir"] : undefined;
     const chosenDir = explicitQmdDir(cliQmdDirFlag);
     const localConfigPath = chosenDir ? configPathInQmdDir(chosenDir) : findLocalConfigPath();
+    if (chosenDir && localConfigPath) markChosenConfigPath(localConfigPath);
     if (localConfigPath) {
       setConfigSource({ configPath: localConfigPath });
       storeDbPathOverride = getLocalDbPath(localConfigPath);
