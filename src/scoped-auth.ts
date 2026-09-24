@@ -34,12 +34,18 @@ function stringArray(value: unknown, name: string, maximum: number): string[] {
   return values as string[];
 }
 
-function decodePart(part: string): unknown {
+function decodePart(part: string): Record<string, unknown> {
+  let value: unknown;
   try {
-    return JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
+    value = JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
   } catch {
     throw new ScopedAuthError("Malformed scoped token");
   }
+  // `null`, arrays and scalars are valid JSON but not a JWT header or claims set.
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ScopedAuthError("Malformed scoped token");
+  }
+  return value as Record<string, unknown>;
 }
 
 export function loadScopedSearchConfig(env: NodeJS.ProcessEnv = process.env): ScopedSearchConfig | null {
@@ -76,8 +82,8 @@ export function verifyScopedSearchToken(
 ): ScopedSearchClaims {
   const parts = token.split(".");
   if (parts.length !== 3 || parts.some(part => !part)) throw new ScopedAuthError("Malformed scoped token");
-  const header = decodePart(parts[0]!) as Record<string, unknown>;
-  const payload = decodePart(parts[1]!) as Record<string, unknown>;
+  const header = decodePart(parts[0]!);
+  const payload = decodePart(parts[1]!);
   if (header.alg !== "HS256" || (header.typ !== undefined && header.typ !== "JWT")) {
     throw new ScopedAuthError("Unsupported scoped token algorithm");
   }

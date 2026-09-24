@@ -48,6 +48,15 @@ describe("scoped QMD token verification", () => {
     expect(() => verifyScopedSearchToken(token(overrides, header), config, now + 1)).toThrow(ScopedAuthError);
   });
 
+  test.each([
+    ["header", "null"], ["payload", "null"], ["header", "[]"], ["payload", "42"],
+  ])("rejects a correctly signed %s that decodes to %s as a scoped-auth error", (part, json) => {
+    const parts = token().split(".");
+    parts[part === "header" ? 0 : 1] = Buffer.from(json).toString("base64url");
+    parts[2] = createHmac("sha256", secret).update(`${parts[0]}.${parts[1]}`).digest("base64url");
+    expect(() => verifyScopedSearchToken(parts.join("."), config, now + 1)).toThrow(ScopedAuthError);
+  });
+
   test("rejects a modified signature", () => {
     const value = token();
     const parts = value.split(".");

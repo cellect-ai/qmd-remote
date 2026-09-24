@@ -148,6 +148,16 @@ describe("tenant-pinned scoped sidecar", () => {
     expect(qdrantCalls).toHaveLength(0);
   });
 
+  test("a token whose header or payload is JSON null is 401, not 500", async () => {
+    const [h, b] = scopedToken().split(".");
+    const nul = Buffer.from("null").toString("base64url");
+    const signed = (head: string, body: string) =>
+      `${head}.${body}.${createHmac("sha256", secret).update(`${head}.${body}`).digest("base64url")}`;
+    expect((await post(lex, signed(nul, b!))).status).toBe(401);
+    expect((await post(lex, signed(h!, nul))).status).toBe(401);
+    expect(qdrantCalls).toHaveLength(0);
+  });
+
   test("client-supplied collections and ACL dimensions are rejected before search", async () => {
     const token = scopedToken();
     expect((await post({ ...lex, collections: ["rooms-shape"] }, token)).status).toBe(400);
