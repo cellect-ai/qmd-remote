@@ -1206,6 +1206,13 @@ function initializeDatabase(db: Database): void {
     _sqliteVecUnavailableReason = getErrorMessage(err);
     console.warn(_sqliteVecUnavailableReason);
   }
+  // Fork tuning for large indexes on slow mounts (6e9adc6/77e4def). WAL and
+  // the busy timeout are set in openDatabase; upstream's 120 s default already
+  // exceeds the fork's 30 s.
+  db.exec("PRAGMA synchronous = NORMAL");
+  db.exec("PRAGMA cache_size = -65536");      // 64MB cache (negative = KB)
+  db.exec("PRAGMA mmap_size = 268435456");    // 256MB memory-mapped I/O
+  db.exec("PRAGMA temp_store = MEMORY");      // Keep temp tables in RAM
   db.exec("PRAGMA foreign_keys = ON");
 
   // Drop legacy tables that are now managed in YAML
