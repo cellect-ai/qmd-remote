@@ -199,10 +199,18 @@ export function clearQmdDirConfig(): void {
   }
 }
 
+let remoteDisabled = false;
+
+/** `qmd --local`: ignore the saved remote config for this process. */
+export function setRemoteDisabled(disabled: boolean): void {
+  remoteDisabled = disabled;
+}
+
 /**
  * Check if remote mode is configured
  */
 export function isRemoteConfigured(): boolean {
+  if (remoteDisabled) return false;
   const config = loadRemoteConfig();
   return !!(config.embedUrl || config.rerankUrl || config.generateUrl);
 }

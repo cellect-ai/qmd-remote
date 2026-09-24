@@ -99,6 +99,7 @@ import {
 } from "./formatter.js";
 import { resolveCommit } from "./version.js";
 import { loadMirrorConfig, saveMirrorConfig, clearMirrorConfig, syncMirror, isMirrorStale, mirrorAgeString, type MirrorConfig } from "../mirror.js";
+import { RemoteLLM, loadRemoteConfig, saveRemoteConfig, clearRemoteConfig, isRemoteConfigured, setRemoteDisabled, loadQmdDirConfig, saveQmdDirConfig, clearQmdDirConfig } from "../llm-remote.js";
 import {
   getCollection as getCollectionFromYaml,
   listCollections as yamlListCollections,
@@ -446,8 +447,36 @@ function sameDirectory(a: string, b: string): boolean {
   }
 }
 
-function initLocalIndex(): void {
-  const cwd = getPwd();
+/** Config file inside a chosen .qmd directory: index.yaml if present, else index.yml. */
+function configPathInQmdDir(qmdDir: string): string {
+  const yamlPath = pathJoin(qmdDir, "index.yaml");
+  return existsSync(yamlPath) ? yamlPath : pathJoin(qmdDir, "index.yml");
+}
+
+/** Why the saved `qmd init <path>` directory is not used, or null when it is eligible. */
+function savedQmdDirIgnoredReason(): string | null {
+  // As on the fork, explicit INDEX_PATH / QMD_CONFIG_DIR beat the saved
+  // pointer. Containers set both, so a mounted config.json that also names a
+  // qmdDir cannot move a sidecar's index or config.
+  if (process.env.INDEX_PATH) return "INDEX_PATH is set";
+  if (process.env.QMD_CONFIG_DIR) return "QMD_CONFIG_DIR is set";
+  return null;
+}
+
+/**
+ * The .qmd directory chosen explicitly: `--qmd-dir`, else the directory saved
+ * by `qmd init <path>`. Project-local discovery applies when this is null.
+ */
+function explicitQmdDir(flag: string | undefined): string | null {
+  if (flag) return pathResolve(flag);
+  if (savedQmdDirIgnoredReason()) return null;
+  return loadQmdDirConfig();
+}
+
+let cliQmdDirFlag: string | undefined;
+
+function initLocalIndex(targetDir: string = getPwd()): void {
+  const cwd = targetDir;
   if (sameDirectory(cwd, homedir())) {
     throw new Error("Refusing to initialize a local index in $HOME. The global index is automatically created; run `qmd collection add <path>` for the global index, or run `qmd init` inside a project folder.");
   }
@@ -3040,6 +3069,13 @@ function parseCLI() {
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
       "no-gpu": { type: "boolean", default: false },
+      // Index location and remote LLM options
+      "qmd-dir": { type: "string" },
+      local: { type: "boolean" },
+      "embed-url": { type: "string" },
+      "rerank-url": { type: "string" },
+      "generate-url": { type: "string" },
+      "generate-model": { type: "string" },
       intent: { type: "string" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
@@ -3056,16 +3092,25 @@ function parseCLI() {
   if (values["no-gpu"]) {
     process.env.QMD_FORCE_CPU = "1";
   }
+  if (values.local) {
+    setRemoteDisabled(true);
+  }
 
   // Select index name (default: "index"). If no explicit --index is supplied,
   // a project-local .qmd/index.yaml overrides the global config/cache paths.
   const indexName = values.index as string | undefined;
   if (indexName) {
+    if (typeof values["qmd-dir"] === "string") {
+      console.error("--qmd-dir cannot be combined with --index");
+      process.exit(1);
+    }
     setIndexName(indexName);
     setConfigIndexName(indexName);
     setConfigSource();
   } else {
-    const localConfigPath = findLocalConfigPath();
+    cliQmdDirFlag = typeof values["qmd-dir"] === "string" ? values["qmd-dir"] : undefined;
+    const chosenDir = explicitQmdDir(cliQmdDirFlag);
+    const localConfigPath = chosenDir ? configPathInQmdDir(chosenDir) : findLocalConfigPath();
     if (localConfigPath) {
       setConfigSource({ configPath: localConfigPath });
       storeDbPathOverride = getLocalDbPath(localConfigPath);
@@ -3559,6 +3604,8 @@ function showHelp(): void {
   console.log("");
   console.log("Maintenance:");
   console.log("  qmd init                      - Create a project-local .qmd index");
+  console.log("  qmd init <path> | clear       - Create/adopt <path>/.qmd and use it from anywhere; clear resets");
+  console.log("  qmd where                     - Show which index and config are active, and why");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull] [--full]  - Re-index collections (optionally git pull first)");
   console.log("    QMD_UPDATE_INCREMENTAL=1    - Skip files whose mtime is unchanged; --full re-reads all");
@@ -3612,6 +3659,11 @@ function showHelp(): void {
   console.log("  - `qmd --skill` is kept as an alias for `qmd skill show`.");
   console.log("  - Advanced: `qmd mcp --http ...` and `qmd mcp --http --daemon` are optional for custom transports.");
   console.log("");
+  console.log("Remote LLM backend:");
+  console.log("  qmd remote set <urls>         - Configure remote embed/rerank/generate endpoints");
+  console.log("  qmd remote status             - Show remote config and check health");
+  console.log("  qmd remote clear              - Clear remote config (revert to local)");
+  console.log("");
   console.log("Mirror (cached local copies of remote indexes):");
   console.log("  qmd mirror <ssh-src> [path]   - Set up local cache of remote .qmd index");
   console.log("  qmd mirror sync               - Re-sync from recorded source");
@@ -3620,6 +3672,8 @@ function showHelp(): void {
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
+  console.log("  --qmd-dir <path>           - Use the index and config in this .qmd directory");
+  console.log("  --local                    - Force local LLM mode (ignore remote config)");
   console.log("  QMD_EDITOR_URI             - Editor link template for clickable TTY search output");
   console.log("");
   console.log("Search options:");
@@ -4587,13 +4641,146 @@ if (isMain) {
       break;
     }
 
-    case "init":
+    case "init": {
+      const target = cli.args[0];
+      if (target === "clear") {
+        clearQmdDirConfig();
+        console.log(`${c.green}✓${c.reset} Cleared saved .qmd directory path`);
+        console.log(`${c.dim}Will now auto-discover from current directory${c.reset}`);
+        break;
+      }
       try {
-        initLocalIndex();
+        if (!target) {
+          initLocalIndex();
+          break;
+        }
+        // `init <path>`: create (or adopt) <path>/.qmd and remember it so
+        // qmd uses that index from any directory.
+        const targetDir = pathResolve(target);
+        const qmdDir = pathJoin(targetDir, ".qmd");
+        const existing = existsSync(pathJoin(qmdDir, "index.yml")) || existsSync(pathJoin(qmdDir, "index.yaml"));
+        if (!existing) initLocalIndex(targetDir);
+        saveQmdDirConfig(qmdDir);
+        console.log(`${c.green}✓${c.reset} ${existing ? "Saved" : "Initialized and saved"} .qmd directory: ${qmdDir}`);
+        console.log(`${c.dim}Index location: ${pathJoin(qmdDir, "index.sqlite")}${c.reset}`);
+        console.log(`${c.dim}QMD will now use this directory from anywhere. Run 'qmd init clear' to reset to auto-discovery.${c.reset}`);
+        const ignored = savedQmdDirIgnoredReason();
+        if (ignored) console.log(`${c.yellow}Note: ${ignored}, which takes precedence over the saved directory.${c.reset}`);
       } catch (error) {
         exitWithError(error);
       }
       break;
+    }
+
+    case "where": {
+      const savedDir = loadQmdDirConfig();
+      const ignored = savedQmdDirIgnoredReason();
+      const autoConfig = findLocalConfigPath();
+      const active = cli.values.index ? "index"
+        : cliQmdDirFlag ? "flag"
+        : savedDir && !ignored ? "saved"
+        : autoConfig ? "auto"
+        : "global";
+      const mark = (key: string) => active === key ? ` ${c.dim}(active)${c.reset}` : "";
+      console.log(`${c.bold}QMD Index Location${c.reset}\n`);
+      console.log(`${c.dim}Database:${c.reset}  ${getDbPath()}`);
+      console.log(`${c.dim}Config:${c.reset}    ${getConfigPath()}`);
+      console.log(`\n${c.bold}Resolution Priority:${c.reset}`);
+      console.log(`  1. --index:                 ${cli.values.index ? String(cli.values.index) : `${c.dim}not set${c.reset}`}${mark("index")}`);
+      console.log(`  2. --qmd-dir:               ${cliQmdDirFlag ? pathResolve(cliQmdDirFlag) : `${c.dim}not set${c.reset}`}${mark("flag")}`);
+      console.log(`  3. Saved (qmd init <path>): ${savedDir ? `${savedDir}${ignored ? ` ${c.dim}(ignored: ${ignored})${c.reset}` : ""}` : `${c.dim}not set${c.reset}`}${mark("saved")}`);
+      console.log(`  4. Project-local .qmd:      ${autoConfig ? dirname(autoConfig) : `${c.dim}none found${c.reset}`}${mark("auto")}`);
+      console.log(`  5. Global:                  ${active === "global" ? `${c.dim}(active)${c.reset}` : `${c.dim}fallback${c.reset}`}`);
+      break;
+    }
+
+    case "remote": {
+      const subcommand = cli.args[0];
+      if (!subcommand) {
+        console.error("Usage: qmd remote <set|status|clear>");
+        console.error("");
+        console.error("Commands:");
+        console.error("  qmd remote set <embed-url> <rerank-url> <generate-url>");
+        console.error("  qmd remote status       - Show current remote configuration");
+        console.error("  qmd remote clear        - Clear remote config (use local mode)");
+        process.exit(1);
+      }
+
+      switch (subcommand) {
+        case "set": {
+          let embedUrl = cli.values["embed-url"] as string | undefined;
+          let rerankUrl = cli.values["rerank-url"] as string | undefined;
+          let generateUrl = cli.values["generate-url"] as string | undefined;
+          const generateModel = cli.values["generate-model"] as string | undefined;
+
+          if (cli.args.length >= 4) {
+            embedUrl = cli.args[1];
+            rerankUrl = cli.args[2];
+            generateUrl = cli.args[3];
+          } else if (cli.args.length === 2 && cli.args[1]) {
+            embedUrl = cli.args[1];
+            rerankUrl = cli.args[1];
+            generateUrl = cli.args[1];
+          }
+
+          if (!embedUrl && !rerankUrl && !generateUrl && !generateModel) {
+            console.error("Usage: qmd remote set <embed-url> <rerank-url> <generate-url>");
+            process.exit(1);
+          }
+
+          const existingConfig = loadRemoteConfig();
+          const newConfig = {
+            embedUrl: embedUrl ?? existingConfig.embedUrl,
+            rerankUrl: rerankUrl ?? existingConfig.rerankUrl,
+            generateUrl: generateUrl ?? existingConfig.generateUrl,
+            generateModel: generateModel ?? existingConfig.generateModel,
+          };
+
+          saveRemoteConfig(newConfig);
+          console.log("Remote configuration saved");
+          console.log(`  Embed:    ${newConfig.embedUrl || "(not set)"}`);
+          console.log(`  Rerank:   ${newConfig.rerankUrl || "(not set)"}`);
+          console.log(`  Generate: ${newConfig.generateUrl || "(not set)"}`);
+          if (newConfig.generateModel) {
+            console.log(`  Generate model: ${newConfig.generateModel}`);
+          }
+          break;
+        }
+        case "status": {
+          const config = loadRemoteConfig();
+          if (!config.embedUrl && !config.rerankUrl && !config.generateUrl) {
+            console.log("Remote mode: disabled (using local models)");
+          } else {
+            console.log("Remote Configuration\n");
+            console.log(`  Embed:    ${config.embedUrl || "(not set)"}`);
+            console.log(`  Rerank:   ${config.rerankUrl || "(not set)"}`);
+            console.log(`  Generate: ${config.generateUrl || "(not set)"}`);
+            if (config.generateModel) {
+              console.log(`  Generate model: ${config.generateModel}`);
+            }
+            // Reflects the process switch set by --local, not just the flag.
+            if (!isRemoteConfigured()) console.log(`\n${c.yellow}--local: this invocation ignores the remote configuration.${c.reset}`);
+            console.log("\nChecking endpoint health...");
+            const remote = new RemoteLLM(config);
+            const health = await remote.checkHealth();
+            console.log(`  Embed:    ${health.embed ? "healthy" : "unreachable"}`);
+            console.log(`  Rerank:   ${health.rerank ? "healthy" : "unreachable"}`);
+            console.log(`  Generate: ${health.generate ? "healthy" : "unreachable"}`);
+          }
+          break;
+        }
+        case "clear": {
+          clearRemoteConfig();
+          console.log("Remote configuration cleared");
+          console.log("Now using local models");
+          break;
+        }
+        default:
+          console.error(`Unknown remote subcommand: ${subcommand}`);
+          process.exit(1);
+      }
+      break;
+    }
 
     case "status":
       await showStatus();
@@ -4887,10 +5074,11 @@ if (isMain) {
 
     case "mirror": {
       const sub = cli.args[0];
-      // The fork resolved the mirror through a saved global .qmd directory;
-      // this lineage uses project-local .qmd discovery, so find the nearest
-      // mirror above the working directory instead.
+      // The mirror is the explicitly chosen .qmd directory (--qmd-dir or the
+      // saved `qmd init <path>` one), else the nearest one above the cwd.
       const findMirrorDir = (): string | null => {
+        const chosen = explicitQmdDir(cliQmdDirFlag);
+        if (chosen && existsSync(pathJoin(chosen, ".mirror.json"))) return chosen;
         let dir = pathResolve(getPwd());
         while (true) {
           const candidate = pathJoin(dir, ".qmd");
@@ -4997,8 +5185,11 @@ if (isMain) {
           process.exit(1);
         }
 
+        // Point qmd at the new local copy, as the fork did.
+        saveQmdDirConfig(localPath);
+
         console.log(`${c.green}✓${c.reset} Mirror ready at ${localPath}`);
-        console.log(`${c.dim}Use it from ${dirname(localPath)} (project-local .qmd). Its config came from the remote host: review it and run 'qmd trust' there before relying on its hooks, paths or models. Run 'qmd mirror sync' to refresh.${c.reset}`);
+        console.log(`${c.dim}Index is now active. Its config came from the remote host: review it and run 'qmd trust' before relying on its hooks, out-of-project paths or models. Run 'qmd mirror sync' to refresh.${c.reset}`);
       }
       break;
     }

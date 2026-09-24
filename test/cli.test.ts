@@ -1326,21 +1326,39 @@ ${token}
   });
 });
 
+/** A private HOME so saved remote/.qmd-directory config never touches the real one. */
+async function isolatedHome(prefix: string): Promise<Record<string, string>> {
+  const home = join(testDir, `${prefix}-home-${++testCounter}`);
+  await mkdir(home, { recursive: true });
+  return { HOME: home, XDG_CACHE_HOME: join(home, ".cache"), XDG_CONFIG_HOME: join(home, ".config") };
+}
+
+/** Env that lets the saved `qmd init <path>` directory apply (INDEX_PATH/QMD_CONFIG_DIR unset). */
+const noIndexEnv = { INDEX_PATH: "", QMD_CONFIG_DIR: "" };
+
+function savedConfig(home: Record<string, string>): Record<string, any> {
+  return JSON.parse(readFileSync(join(home.HOME!, ".cache", "qmd", "config.json"), "utf8"));
+}
+
 describe("CLI Mirror Command", () => {
-  test("sets up, reports and clears a mirror using rsync from PATH", async () => {
+  test("sets up, activates, reports and clears a mirror using rsync from PATH", async () => {
     const { dbPath, configDir } = await createIsolatedTestEnv("mirror");
     const binDir = join(testDir, `mirror-bin-${Date.now()}`);
     await mkdir(binDir, { recursive: true });
     // Stub rsync: copy a canned index.yml into the destination (last argument).
     await writeFile(join(binDir, "rsync"), '#!/bin/sh\nfor last; do :; done\nprintf "collections: {}\\n" > "${last}index.yml"\n');
     await chmod(join(binDir, "rsync"), 0o755);
-    const env = { PATH: `${binDir}:${process.env.PATH}` };
+    const env = { PATH: `${binDir}:${process.env.PATH}`, ...(await isolatedHome("mirror")) };
     const parent = join(testDir, `mirror-local-${Date.now()}`);
 
     const setup = await runQmd(["mirror", "gpu:/srv/agent/.qmd", parent], { dbPath, configDir, env });
     expect(setup.exitCode).toBe(0);
     expect(setup.stdout).toContain(`Mirror ready at ${join(parent, ".qmd")}`);
     expect(existsSync(join(parent, ".qmd", "index.yml"))).toBe(true);
+    // Like the fork, the mirror becomes the active index from any directory.
+    expect(savedConfig(env).qmdDir).toBe(join(parent, ".qmd"));
+    const where = await runQmd(["where"], { dbPath, configDir, env: { ...env, ...noIndexEnv }, cwd: testDir });
+    expect(where.stdout).toContain(join(parent, ".qmd", "index.sqlite"));
 
     const status = await runQmd(["mirror", "status"], { dbPath, configDir, env, cwd: parent });
     expect(status.exitCode).toBe(0);
@@ -1351,6 +1369,110 @@ describe("CLI Mirror Command", () => {
     expect(clear.exitCode).toBe(0);
     const after = await runQmd(["mirror", "status"], { dbPath, configDir, env, cwd: parent });
     expect(after.stdout).toContain("No mirror configured");
+  });
+});
+
+describe("CLI Remote Command", () => {
+  test("set, status and clear the saved remote endpoints", async () => {
+    const env = await isolatedHome("remote");
+    const set = await runQmd(["remote", "set", "http://127.0.0.1:9", "http://127.0.0.1:9", "http://127.0.0.1:9", "--generate-model", "fast"], { env });
+    expect(set.exitCode).toBe(0);
+    expect(set.stdout).toContain("Remote configuration saved");
+    expect(savedConfig(env).remote).toEqual({
+      embedUrl: "http://127.0.0.1:9", rerankUrl: "http://127.0.0.1:9", generateUrl: "http://127.0.0.1:9", generateModel: "fast",
+    });
+
+    const status = await runQmd(["remote", "status"], { env });
+    expect(status.exitCode).toBe(0);
+    expect(status.stdout).toContain("Generate model: fast");
+    expect(status.stdout).toContain("unreachable");
+
+    const local = await runQmd(["remote", "status", "--local"], { env });
+    expect(local.stdout).toContain("--local: this invocation ignores the remote configuration");
+
+    const clear = await runQmd(["remote", "clear"], { env });
+    expect(clear.exitCode).toBe(0);
+    expect(savedConfig(env).remote).toBeUndefined();
+    expect((await runQmd(["remote", "status"], { env })).stdout).toContain("Remote mode: disabled");
+  });
+
+  test("set keeps unspecified endpoints and rejects an empty call", async () => {
+    const env = await isolatedHome("remote-merge");
+    await runQmd(["remote", "set", "http://gpu:8081", "http://gpu:8082", "http://gpu:8083"], { env });
+    await runQmd(["remote", "set", "--rerank-url", "http://other:8082"], { env });
+    expect(savedConfig(env).remote).toMatchObject({ embedUrl: "http://gpu:8081", rerankUrl: "http://other:8082", generateUrl: "http://gpu:8083" });
+    expect((await runQmd(["remote", "set"], { env })).exitCode).toBe(1);
+  });
+});
+
+describe("CLI init <path>, --qmd-dir and where", () => {
+  test("init <path> creates a .qmd index that is used from any directory until init clear", async () => {
+    const home = await isolatedHome("init-path");
+    const env = { ...home, ...noIndexEnv };
+    const target = join(testDir, `init-target-${Date.now()}`);
+    const docs = join(testDir, `init-docs-${Date.now()}`);
+    await mkdir(target, { recursive: true });
+    await mkdir(docs, { recursive: true });
+    await writeFile(join(docs, "note.md"), "# Note\n\nsaved-dir-proof\n");
+
+    const init = await runQmd(["init", target], { env, cwd: testDir });
+    expect(init.exitCode).toBe(0);
+    expect(existsSync(join(target, ".qmd", "index.yml"))).toBe(true);
+    expect(savedConfig(home).qmdDir).toBe(join(target, ".qmd"));
+
+    const add = await runQmd(["collection", "add", docs, "--name", "saved"], { env, cwd: docs });
+    expect(add.exitCode).toBe(0);
+    const db = openDatabase(join(target, ".qmd", "index.sqlite"));
+    try {
+      expect((db.prepare(`SELECT COUNT(*) AS n FROM documents WHERE collection = 'saved' AND active = 1`).get() as { n: number }).n).toBe(1);
+    } finally {
+      db.close();
+    }
+
+    const where = await runQmd(["where"], { env, cwd: docs });
+    expect(where.exitCode).toBe(0);
+    expect(where.stdout).toContain(`Database:  ${join(target, ".qmd", "index.sqlite")}`);
+    expect(where.stdout).toMatch(/Saved \(qmd init <path>\): \S+.*\(active\)/);
+
+    // Re-running init on an existing index only re-saves the pointer.
+    const again = await runQmd(["init", target], { env, cwd: testDir });
+    expect(again.stdout).toContain("Saved .qmd directory");
+
+    const clear = await runQmd(["init", "clear"], { env, cwd: testDir });
+    expect(clear.exitCode).toBe(0);
+    expect(savedConfig(home).qmdDir).toBeUndefined();
+    expect((await runQmd(["where"], { env, cwd: docs })).stdout).not.toContain(join(target, ".qmd", "index.sqlite"));
+  });
+
+  test("INDEX_PATH and QMD_CONFIG_DIR beat a saved directory, as in the sidecar image", async () => {
+    const home = await isolatedHome("init-env");
+    const elsewhere = join(testDir, `saved-elsewhere-${Date.now()}`);
+    await mkdir(join(elsewhere, ".qmd"), { recursive: true });
+    await mkdir(join(home.HOME!, ".cache", "qmd"), { recursive: true });
+    await writeFile(join(home.HOME!, ".cache", "qmd", "config.json"), JSON.stringify({ qmdDir: join(elsewhere, ".qmd") }));
+    const { dbPath, configDir } = await createIsolatedTestEnv("sidecar-env");
+
+    const where = await runQmd(["where"], { dbPath, configDir, env: home, cwd: testDir });
+    expect(where.exitCode).toBe(0);
+    expect(where.stdout).toContain(`Database:  ${dbPath}`);
+    expect(where.stdout).toContain(`Config:    ${join(configDir, "index.yml")}`);
+    expect(where.stdout).toContain("ignored: INDEX_PATH is set");
+  });
+
+  test("--qmd-dir selects a .qmd directory for one invocation and cannot be combined with --index", async () => {
+    const home = await isolatedHome("qmd-dir");
+    const env = { ...home, ...noIndexEnv };
+    const dir = join(testDir, `flag-dir-${Date.now()}`, ".qmd");
+    await mkdir(dir, { recursive: true });
+
+    const where = await runQmd(["where", "--qmd-dir", dir], { env, cwd: testDir });
+    expect(where.exitCode).toBe(0);
+    expect(where.stdout).toContain(`Database:  ${join(dir, "index.sqlite")}`);
+    expect(where.stdout).toMatch(/--qmd-dir: +\S+.*\(active\)/);
+
+    const both = await runQmd(["where", "--qmd-dir", dir, "--index", "other"], { env, cwd: testDir });
+    expect(both.exitCode).toBe(1);
+    expect(both.stderr).toContain("--qmd-dir cannot be combined with --index");
   });
 });
 
