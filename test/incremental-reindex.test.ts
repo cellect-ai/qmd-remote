@@ -73,6 +73,25 @@ describe("reindexCollection incremental mode", () => {
     expect(body("doc.md")).toContain("second");
   });
 
+  test("a touched but unchanged file gets its mtime refreshed and is skipped next time", async () => {
+    const doc = join(collectionDir, "doc.md");
+    await rewriteWithOldMtime(doc, "# Doc\n\nsame\n");
+    await reindexCollection(store, collectionDir, "**/*.md", "notes");
+    const future = new Date(Date.now() + 60_000);
+    await utimes(doc, future, future);
+
+    const touched = await reindexCollection(store, collectionDir, "**/*.md", "notes", { incremental: true });
+    expect(touched).toMatchObject({ updated: 0, unchanged: 1 });
+    const stored = (store.db.prepare(`SELECT modified_at FROM documents WHERE path = 'doc.md'`).get() as { modified_at: string }).modified_at;
+    expect(stored).toBe(future.toISOString());
+
+    // Change content while keeping the refreshed mtime: the skip proves the row was updated.
+    await writeFile(doc, "# Doc\n\nchanged\n");
+    await utimes(doc, future, future);
+    await reindexCollection(store, collectionDir, "**/*.md", "notes", { incremental: true });
+    expect(body("doc.md")).toContain("same");
+  });
+
   test("re-reads an unchanged-mtime file whose metadata extraction is stale", async () => {
     const doc = join(collectionDir, "doc.md");
     await rewriteWithOldMtime(doc, "---\nqmd:\n  metadata:\n    status: draft\n---\n\n# Doc\n");

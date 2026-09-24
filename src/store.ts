@@ -1712,6 +1712,7 @@ export async function reindexCollection(
 
       let content: string;
       let stat: Stats;
+      let indexedAt: string | undefined;
       try {
         stat = await withFileIoTimeout(fsStat(filepath), `stat ${relativeFile}`);
         // Skip empty files without reading them.
@@ -1720,7 +1721,7 @@ export async function reindexCollection(
           continue;
         }
         if (incremental && existing) {
-          const indexedAt = (db.prepare(`SELECT modified_at FROM documents WHERE id = ?`)
+          indexedAt = (db.prepare(`SELECT modified_at FROM documents WHERE id = ?`)
             .get(existing.id) as { modified_at: string } | undefined)?.modified_at;
           if (indexedAt && new Date(stat.mtime).toISOString() <= indexedAt && isDocumentMetadataCurrent(db, existing.id)) {
             unchanged++;
@@ -1760,6 +1761,12 @@ export async function reindexCollection(
             updated++;
           } else {
             unchanged++;
+            // Touched but unchanged (touch, copy, restore): record the new
+            // mtime so the next incremental pass can skip it again (94d1206).
+            const fileMtime = new Date(stat.mtime).toISOString();
+            if (incremental && fileMtime !== indexedAt) {
+              db.prepare(`UPDATE documents SET modified_at = ? WHERE id = ?`).run(fileMtime, existing.id);
+            }
           }
         } else {
           insertContent(db, hash, content, now);
