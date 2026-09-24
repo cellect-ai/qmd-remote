@@ -1232,7 +1232,7 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
-| `QMD_EMBED_DOC_FORMAT` | `raw` | Document text embedded per chunk. `cleaned` strips markdown artifacts, collapses whitespace and caps title (150) and text (1500 chars), the format central Cellect QMD indexed with. Keep the format an index was built with; switching needs `qmd embed -f` and `qmd qdrant-import --rebuild`. |
+| `QMD_EMBED_DOC_FORMAT` | `raw` | Document text embedded per chunk. `cleaned` strips markdown artifacts, collapses whitespace and caps title (150) and text (1500 chars), the format central Cellect QMD indexed with. Keep the format an index was built with; switching needs `qmd embed -f` and `qmd qdrant-import --rebuild`. `qdrant-import` records the format per document and refuses to mix them; a manifest written before the format was recorded needs this set explicitly once, to adopt it. |
 | `QMD_UPDATE_INCREMENTAL` | unset | Set to `1` so `qmd update` skips files whose mtime is not newer than the index (and runs each pass in one transaction). `qmd update --full` re-reads everything. |
 
 ## How It Works

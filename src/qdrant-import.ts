@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { openDatabase, type Database } from "./db.js";
-import { formatDocForEmbedding } from "./llm.js";
+import { embedDocFormat, formatDocForEmbedding } from "./llm.js";
 import { getDefaultRemoteLLM } from "./llm-remote.js";
 import { chunkDocument, handelize } from "./store.js";
 import { qdrantDomainForCollection, type QdrantDomain } from "./qdrant.js";
@@ -40,7 +40,57 @@ const REMOTE_CHUNK_OVERLAP_CHARS = Math.floor(900 * 0.15) * 3;
 const REMOTE_CHUNK_WINDOW_CHARS = 200 * 3;
 const EMBEDDING_DIMENSIONS = 768;
 const EMBED_BATCH_SIZE = 32;
+/**
+ * Model and vector generation. Rows written before the document text format
+ * was recorded carry exactly this value; current rows append the format.
+ */
 export const QDRANT_EMBED_SPEC = "embeddinggemma-768|v1";
+
+/** Embed spec for the given (or configured) QMD_EMBED_DOC_FORMAT. */
+export function qdrantEmbedSpec(format: "raw" | "cleaned" | NodeJS.ProcessEnv = process.env): string {
+  const resolved = typeof format === "string" ? format : embedDocFormat(format);
+  return `${QDRANT_EMBED_SPEC}|doc-${resolved}`;
+}
+
+/**
+ * Refuse to mix document formats in one manifest (and so one Qdrant alias).
+ * Unlabeled rows are adopted only when QMD_EMBED_DOC_FORMAT is set explicitly,
+ * because central (cleaned) and the Rooms sidecars (raw) both wrote the bare
+ * spec. `--rebuild` re-embeds every document, so it may change the format.
+ * Returns the spec this run writes.
+ */
+export function reconcileManifestDocFormat(
+  manifest: Database,
+  env: NodeJS.ProcessEnv = process.env,
+  options: { rebuild?: boolean } = {},
+): string {
+  const format = embedDocFormat(env);
+  const current = qdrantEmbedSpec(format);
+  if (options.rebuild) return current;
+  const count = (spec: string) => (manifest.prepare(
+    `SELECT COUNT(*) AS n FROM qdrant_documents WHERE embed_spec = ?`,
+  ).get(spec) as { n: number }).n;
+  const other = format === "raw" ? "cleaned" : "raw";
+  const mismatched = count(qdrantEmbedSpec(other));
+  if (mismatched > 0) {
+    throw new Error(
+      `Qdrant manifest holds ${mismatched} documents embedded with QMD_EMBED_DOC_FORMAT=${other}, `
+      + `but this run uses ${format}. Set QMD_EMBED_DOC_FORMAT=${other}, or re-embed everything with --rebuild.`,
+    );
+  }
+  const unlabeled = count(QDRANT_EMBED_SPEC);
+  if (unlabeled > 0) {
+    if (!env.QMD_EMBED_DOC_FORMAT?.trim()) {
+      throw new Error(
+        `Qdrant manifest holds ${unlabeled} documents from before the document format was recorded. `
+        + "Set QMD_EMBED_DOC_FORMAT to the format they were built with (raw for the Rooms sidecars, "
+        + "cleaned for central QMD) to adopt them.",
+      );
+    }
+    manifest.prepare(`UPDATE qdrant_documents SET embed_spec = ? WHERE embed_spec = ?`).run(current, QDRANT_EMBED_SPEC);
+  }
+  return current;
+}
 export const QDRANT_CHUNK_SPEC = "chars-2700-overlap-405-window-600|v2-direct";
 export const QDRANT_LEGACY_CHUNK_SPEC = "legacy-sqlite";
 
@@ -514,7 +564,7 @@ async function importDocument(
     document.hash,
     document.collection,
     points.length,
-    QDRANT_EMBED_SPEC,
+    qdrantEmbedSpec(),
     QDRANT_CHUNK_SPEC,
     new Date().toISOString(),
   );
@@ -564,7 +614,7 @@ async function syncChangedDocuments(
       if (
         previous?.hash === document.hash
         && previous.collection === document.collection
-        && previous.embed_spec === QDRANT_EMBED_SPEC
+        && previous.embed_spec === qdrantEmbedSpec()
       ) {
         if (previous.chunk_spec === QDRANT_LEGACY_CHUNK_SPEC) continue;
         if (previous.chunk_spec === QDRANT_CHUNK_SPEC) {
@@ -661,6 +711,7 @@ export async function importQdrant(): Promise<void> {
   const db = openDatabase(dbPath);
   const manifest = openDatabase(manifestPath);
   initializeManifest(manifest);
+  reconcileManifestDocFormat(manifest, process.env, { rebuild });
   const endpoint = config();
   if (domainArg === "cellect") alias(endpoint, "cellect");
   const embedder = getDefaultRemoteLLM();
@@ -692,7 +743,7 @@ export async function importQdrant(): Promise<void> {
         status: "complete",
         documentId,
         points,
-        embedSpec: QDRANT_EMBED_SPEC,
+        embedSpec: qdrantEmbedSpec(),
         chunkSpec: QDRANT_CHUNK_SPEC,
       }));
       return;
