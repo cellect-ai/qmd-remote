@@ -238,6 +238,8 @@ async function queryGrouped(
   limit: number,
 ): Promise<QdrantPoint[]> {
   if (prefetch.length === 0) return [];
+  const alias = config.aliases[domain];
+  if (!alias) throw new Error(`An explicit Qdrant alias is required for ${domain}`);
   const body = prefetch.length === 1
     ? { ...prefetch[0], group_by: "document_id", group_size: 1, limit, with_payload: true }
     : {
@@ -250,7 +252,7 @@ async function queryGrouped(
     };
   const result = await qdrantRequest<{ result: { groups: QdrantGroup[] } }>(
     config,
-    `/collections/${encodeURIComponent(config.aliases[domain])}/points/query/groups`,
+    `/collections/${encodeURIComponent(alias)}/points/query/groups`,
     body,
   );
   return result.result.groups.flatMap(group => group.hits.slice(0, 1));
@@ -424,14 +426,14 @@ export async function searchQdrant(
   // a large candidateLimit into a backend 400.
   const candidateLimit = Math.min(100, Math.max(options.limit, options.candidateLimit ?? 40));
   const domainResults = await Promise.all(
-    Object.keys(grouped)
-      .filter(domain => grouped[domain].length > 0)
-      .map(domain => queryDomain(
+    Object.entries(grouped)
+      .filter(([, names]) => names.length > 0)
+      .map(([domain, names]) => queryDomain(
         config,
         domain,
         searches,
         embeddings,
-        grouped[domain],
+        names,
         candidateLimit,
         options.scope,
         options.documentIds,
