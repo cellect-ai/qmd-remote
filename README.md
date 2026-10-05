@@ -1229,6 +1229,7 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
 | `XDG_CONFIG_HOME` | `~/.config` | Config directory location (where `index.yml` lives) |
 | `QMD_CONFIG_DIR` | unset | Override the config directory outright (takes precedence over `XDG_CONFIG_HOME`) |
+| `QMD_QDRANT_DOMAIN_REGISTRY` | unset | JSON object registering additional search domains with an explicit `alias`, exact `collections`, and optional collection `prefixes`. Aliases must be distinct and mappings must not overlap any other domain. Requires a separately provisioned Qdrant namespace and credentials; it does not create infrastructure. |
 | `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
@@ -1236,6 +1237,21 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | `QMD_UPDATE_INCREMENTAL` | unset | Set to `1` so `qmd update` skips files whose mtime is not newer than the index (and runs each pass in one transaction). `qmd update --full` re-reads everything. |
 
 ## How It Works
+
+Additional private search tenants are declared in configuration, for example:
+
+```json
+{
+  "terra": { "alias": "rooms_terra_current", "collections": ["rooms-terra"], "prefixes": ["rooms-terra-"] },
+  "yellowstone": { "alias": "rooms_yellowstone_current", "collections": ["rooms-yellowstone"], "prefixes": ["rooms-yellowstone-"] }
+}
+```
+
+Each private sidecar must also explicitly allow its own domain through
+`QMD_QDRANT_ALLOWED_DOMAINS`, pin its scoped token tenant/collections, and use its
+own credentials and index. Unknown `rooms-*` names are rejected rather than
+assigned to Shape. Query and import use the same registry; scoped queries reject
+collection-domain/tenant mismatches before contacting Qdrant.
 
 ### Indexing Flow
 

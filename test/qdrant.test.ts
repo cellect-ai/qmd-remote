@@ -5,6 +5,7 @@ import {
   parseQdrantLexQuery,
   qdrantDomainForCollection,
   qdrantSearchFilter,
+  searchQdrant,
 } from "../src/qdrant.js";
 import {
   aclPayloadForDocument,
@@ -121,14 +122,63 @@ describe("Qdrant collection security domains", () => {
     ["rooms-cellect", "cellect"],
     ["rooms-cellect-corporate", "cellect"],
     ["cellect_docs", "cellect"],
-    ["rooms-other", "shape"],
-    ["rooms-cellectx", "shape"],
   ])("maps %s to %s", (collection, domain) => {
     expect(qdrantDomainForCollection(collection)).toBe(domain);
   });
 
   test("fails closed for a new unclassified collection", () => {
     expect(() => qdrantDomainForCollection("tenant-acme")).toThrow("not classified");
+    expect(() => qdrantDomainForCollection("rooms-other")).toThrow("not classified");
+    expect(() => qdrantDomainForCollection("rooms-cellectx")).toThrow("not classified");
+  });
+});
+
+describe("configured tenant search routing", () => {
+  const registry = {
+    terra: { alias: "rooms_terra_current", collections: ["rooms-terra"] },
+    yellowstone: { alias: "rooms_yellowstone_current", collections: ["rooms-yellowstone"] },
+  };
+  function setup() {
+    vi.stubEnv("QMD_QDRANT_DOMAIN_REGISTRY", JSON.stringify(registry));
+    vi.stubEnv("QMD_QDRANT_URL", "https://qdrant.test");
+    vi.stubEnv("QMD_QDRANT_API_KEY", "test-key");
+    vi.stubEnv("QMD_QDRANT_ALLOWED_DOMAINS", "terra,yellowstone");
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ result: { groups: [] } }), { status: 200 }));
+    vi.stubGlobal("fetch", fetch);
+    return fetch;
+  }
+  const db = { prepare: () => ({ get: () => undefined }) } as unknown as Database;
+  const llm = {} as LLM;
+
+  test.each(["terra", "yellowstone"])("routes %s to its own alias and mandatory ACL", async tenant => {
+    const fetch = setup();
+    await searchQdrant(db, [{ type: "lex", query: "agreement" }], {
+      collections: [`rooms-${tenant}`], limit: 5, llm,
+      scope: { tenant, scopes: [`company:${tenant}`], access: ["documents"] },
+    });
+    expect(fetch).toHaveBeenCalled();
+    for (const [url, init] of fetch.mock.calls as unknown as Array<[string, RequestInit]>) {
+      expect(url).toContain(`/collections/rooms_${tenant}_current/`);
+      expect(init.body).toContain(`"tenant_id","match":{"value":"${tenant}"}`);
+    }
+  });
+
+  test("rejects cross-tenant collection requests before any backend call", async () => {
+    const fetch = setup();
+    await expect(searchQdrant(db, [{ type: "lex", query: "agreement" }], {
+      collections: ["rooms-yellowstone"], limit: 5, llm,
+      scope: { tenant: "terra", scopes: ["company:terra"], access: ["documents"] },
+    })).rejects.toThrow("tenant does not match");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("rejects registered domains not allowed by this runtime", async () => {
+    const fetch = setup();
+    vi.stubEnv("QMD_QDRANT_ALLOWED_DOMAINS", "terra");
+    await expect(searchQdrant(db, [{ type: "lex", query: "agreement" }], {
+      collections: ["rooms-yellowstone"], limit: 5, llm,
+    })).rejects.toThrow("not allowed");
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
 

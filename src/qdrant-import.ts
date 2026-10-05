@@ -4,6 +4,7 @@ import { embedDocFormat, formatDocForEmbedding } from "./llm.js";
 import { getDefaultRemoteLLM } from "./llm-remote.js";
 import { chunkDocument, handelize } from "./store.js";
 import { qdrantDomainForCollection, type QdrantDomain } from "./qdrant.js";
+import { qdrantAliases, validateQdrantImportTenant } from "./qdrant-domains.js";
 
 type ImportState = {
   lastDocumentId: number;
@@ -152,19 +153,13 @@ function config() {
   return {
     url,
     apiKey,
-    aliases: {
-      public: process.env.QMD_QDRANT_PUBLIC_COLLECTION || "cellect_public_current",
-      shape: process.env.QMD_QDRANT_SHAPE_COLLECTION || "tenant_shape_current",
-      // No default: central (`cellect_docs`) and the Rooms sidecar
-      // (`rooms-cellect*`) write different Cellect aliases.
-      cellect: process.env.QMD_QDRANT_CELLECT_COLLECTION?.trim() ?? "",
-    } satisfies Record<QdrantDomain, string>,
+    aliases: qdrantAliases(),
   };
 }
 
 function alias(endpoint: ReturnType<typeof config>, domain: QdrantDomain): string {
   const name = endpoint.aliases[domain];
-  if (!name) throw new Error(`QMD_QDRANT_CELLECT_COLLECTION is required to import ${domain} collections`);
+  if (!name) throw new Error(`An explicit Qdrant alias is required to import ${domain} collections`);
   return name;
 }
 
@@ -522,6 +517,7 @@ async function importDocument(
   replaceExisting: boolean,
 ): Promise<number> {
   const domain = qdrantDomainForCollection(document.collection);
+  validateQdrantImportTenant(domain, aclPayloadForDocument(document)?.tenant_id);
   const previous = manifest.prepare(`
     SELECT hash, collection FROM qdrant_documents WHERE document_id = ?
   `).get(document.id) as { hash: string; collection: string } | null | undefined;
@@ -695,8 +691,8 @@ export async function importQdrant(): Promise<void> {
   const documentId = integerArgument("--document-id", 0);
   const rebuild = process.argv.includes("--rebuild");
   const domainArg = argument("--domain", "all");
-  if (!domainArg || !["all", "public", "shape", "cellect"].includes(domainArg)) {
-    throw new Error("--domain must be all, public, shape, or cellect");
+  if (!domainArg || (domainArg !== "all" && !Object.hasOwn(qdrantAliases(), domainArg))) {
+    throw new Error("--domain must be all or a configured Qdrant security domain");
   }
 
   const state = readState(statePath);
@@ -713,7 +709,7 @@ export async function importQdrant(): Promise<void> {
   initializeManifest(manifest);
   reconcileManifestDocFormat(manifest, process.env, { rebuild });
   const endpoint = config();
-  if (domainArg === "cellect") alias(endpoint, "cellect");
+  if (domainArg !== "all") alias(endpoint, domainArg);
   const embedder = getDefaultRemoteLLM();
   const documentQuery = db.prepare(`
     SELECT d.id, d.collection, d.path, d.title, d.hash, d.modified_at, c.doc AS body

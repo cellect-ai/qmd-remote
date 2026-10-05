@@ -2,8 +2,8 @@ import type { Database } from "./db.js";
 import { formatQueryForEmbedding, type LLM } from "./llm.js";
 import { readFileSync } from "node:fs";
 
-export type QdrantDomain = "public" | "shape" | "cellect";
-const QDRANT_DOMAINS = ["public", "shape", "cellect"] as const;
+import { qdrantAliases, qdrantDomainForCollection, registeredQdrantDomains, type QdrantDomain } from "./qdrant-domains.js";
+export { qdrantDomainForCollection, type QdrantDomain } from "./qdrant-domains.js";
 
 export type QdrantSearch = {
   type: "lex" | "vec" | "hyde";
@@ -67,39 +67,6 @@ type QdrantGroup = {
   hits: QdrantPoint[];
 };
 
-const SHAPE_COLLECTIONS = new Set(["wip", "shape_docusign"]);
-const CELLECT_COLLECTIONS = new Set(["cellect_docs"]);
-const PUBLIC_COLLECTION_PREFIXES = [
-  "jersey_city_",
-  "nj_",
-  "hudson_county_",
-  "hoboken_",
-  "weehawken_",
-  "west_new_york_",
-];
-
-export function qdrantDomainForCollection(collection: string): QdrantDomain {
-  // Both Cellect name rules come before the `rooms-` -> shape rule.
-  if (CELLECT_COLLECTIONS.has(collection)) return "cellect";
-  if (collection === "rooms-cellect" || collection.startsWith("rooms-cellect-")) {
-    return "cellect";
-  }
-  if (
-    SHAPE_COLLECTIONS.has(collection)
-    || collection.startsWith("project-")
-    || collection.startsWith("email-")
-    || collection.startsWith("gdrive_")
-    || collection.startsWith("gdrive-")
-    || collection.startsWith("rooms-")
-  ) {
-    return "shape";
-  }
-  if (PUBLIC_COLLECTION_PREFIXES.some(prefix => collection.startsWith(prefix))) {
-    return "public";
-  }
-  throw new Error(`Qdrant security domain is not classified for collection: ${collection}`);
-}
-
 export function isQdrantConfigured(): boolean {
   return Boolean(process.env.QMD_QDRANT_URL || process.env.QDRANT_URL);
 }
@@ -116,6 +83,11 @@ function allowsCellectWithoutAlias(env: NodeJS.ProcessEnv): boolean {
  * alias. Other settings keep failing on first use, as before.
  */
 export function validateQdrantConfig(env: NodeJS.ProcessEnv = process.env): void {
+  registeredQdrantDomains(env);
+  const aliases = qdrantAliases(env);
+  for (const domain of (env.QMD_QDRANT_ALLOWED_DOMAINS || "").split(",").map(x => x.trim()).filter(Boolean)) {
+    if (!Object.hasOwn(aliases, domain)) throw new Error(`Unknown Qdrant security domain: ${domain}`);
+  }
   if ((env.QMD_QDRANT_URL || env.QDRANT_URL) && allowsCellectWithoutAlias(env)) {
     throw new Error(CELLECT_ALIAS_REQUIRED);
   }
@@ -155,31 +127,27 @@ function loadQdrantConfig(): QdrantConfig {
   if (!apiKey) throw new Error("QMD_QDRANT_API_KEY is required for the Qdrant backend");
 
   const rawAllowed = process.env.QMD_QDRANT_ALLOWED_DOMAINS || "";
+  const aliases = qdrantAliases();
   const allowedDomains = new Set(
     rawAllowed.split(",").map(value => value.trim()).filter(Boolean) as QdrantDomain[],
   );
   for (const domain of allowedDomains) {
-    if (!QDRANT_DOMAINS.includes(domain)) {
+    if (!Object.hasOwn(aliases, domain)) {
       throw new Error(`Unknown Qdrant security domain: ${domain}`);
     }
   }
   if (allowedDomains.size === 0) {
-    throw new Error("QMD_QDRANT_ALLOWED_DOMAINS must explicitly allow public, shape, and/or cellect");
+    throw new Error("QMD_QDRANT_ALLOWED_DOMAINS must explicitly allow configured security domains");
   }
   // The central index (`cellect_docs` -> tenant_cellect_current) and the Rooms
   // sidecar (`rooms-cellect*` -> rooms_cellect_current) use different Cellect
   // aliases, so there is no safe default: every Cellect process names its own.
   if (allowsCellectWithoutAlias(process.env)) throw new Error(CELLECT_ALIAS_REQUIRED);
-  const cellectAlias = process.env.QMD_QDRANT_CELLECT_COLLECTION?.trim() ?? "";
 
   return {
     url,
     apiKey,
-    aliases: {
-      public: process.env.QMD_QDRANT_PUBLIC_COLLECTION || "cellect_public_current",
-      shape: process.env.QMD_QDRANT_SHAPE_COLLECTION || "tenant_shape_current",
-      cellect: cellectAlias,
-    },
+    aliases,
     allowedDomains,
   };
 }
@@ -424,10 +392,14 @@ export async function searchQdrant(
     throw new Error("Qdrant search requires at least one explicit QMD collection");
   }
 
-  const grouped: Record<QdrantDomain, string[]> = { public: [], shape: [], cellect: [] };
-  for (const collection of collections) grouped[qdrantDomainForCollection(collection)].push(collection);
-  for (const domain of QDRANT_DOMAINS) {
-    if (grouped[domain].length > 0 && !config.allowedDomains.has(domain)) {
+  const grouped: Record<QdrantDomain, string[]> = Object.create(null);
+  for (const collection of collections) {
+    const domain = qdrantDomainForCollection(collection);
+    (grouped[domain] ??= []).push(collection);
+    if (options.scope && domain !== "public" && domain !== options.scope.tenant) throw new Error("Scoped Qdrant search tenant does not match collection domain");
+  }
+  for (const domain of Object.keys(grouped)) {
+    if (!config.allowedDomains.has(domain)) {
       throw new Error(`Qdrant security domain is not allowed by this runtime: ${domain}`);
     }
   }
@@ -452,7 +424,7 @@ export async function searchQdrant(
   // a large candidateLimit into a backend 400.
   const candidateLimit = Math.min(100, Math.max(options.limit, options.candidateLimit ?? 40));
   const domainResults = await Promise.all(
-    QDRANT_DOMAINS
+    Object.keys(grouped)
       .filter(domain => grouped[domain].length > 0)
       .map(domain => queryDomain(
         config,

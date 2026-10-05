@@ -4,12 +4,14 @@
 
 ### Added
 
+- Explicit tenant search-domain registration through `QMD_QDRANT_DOMAIN_REGISTRY`, with distinct aliases and non-overlapping collection mappings for additional tenants such as Terra and Yellowstone.
 - Preserve the private Rooms Qdrant and remote-model adapters with upstream typed metadata filtering, applied before retrieval without weakening ACL restrictions.
 - Added Oxlint lint fence.
 - Document metadata and metadata filtering. Markdown documents can opt into typed metadata through a namespaced frontmatter block (`qmd.metadata` with strings, numbers, booleans, or flat homogeneous arrays), and every search surface — CLI `search`/`vsearch`/`query` via `--filter <json>`, the SDK's `filter` option on `search()`/`searchLex()`/`searchVector()`, the MCP `query` tool, and HTTP `POST /query` and `/search` — accepts one shared recursive filter AST discriminated by `operator`: `and`/`or`/`not` logical groups, `eq`/`ne`/`gt`/`gte`/`lt`/`lte` comparisons, `in`/`nin`/`all` membership, and `exists` presence. Every returned result satisfies the filter (applied before RRF fusion and reranking); like collection filtering, highly selective filters remain best-effort for top-K completeness. Frontmatter stays ordinary searchable content — no chunking, embedding, snippet, or line-number changes — and documents without `qmd.metadata` behave exactly as before. JSON/SDK/MCP/HTTP results now include each document's indexed metadata, and `qmd status` reports how many documents still need metadata extraction (a normal `qmd update` backfills existing indexes).
 
 ### Fixed
 
+- Unknown `rooms-*` collections no longer silently use Shape's security domain. Scoped searches reject a tenant/collection-domain mismatch before contacting Qdrant.
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
