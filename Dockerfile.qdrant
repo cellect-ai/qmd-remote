@@ -18,7 +18,13 @@ ARG DEBIAN_FRONTEND=noninteractive
 USER root
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl \
-  && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/* \
+  && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419+deb13u1
+# eMudhra distrust (2026-10-21): 20250419+deb13u1 drops emSign ECC Root CA - G3
+# and AAA Certificate Services from the OS store that curl and OpenSSL use.
+# Bun's own bundled roots are unaffected (infra hardening-todo, Q7).
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_DIR=/etc/ssl/certs
 
 WORKDIR /opt/qmd
 COPY --from=dependencies --chown=1000:1000 /opt/qmd/node_modules /opt/qmd/node_modules
