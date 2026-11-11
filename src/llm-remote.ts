@@ -410,6 +410,9 @@ export class RemoteLLM implements LLM {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          // Cellect's LiteLLM attributes spend by this step; without it every
+          // query expansion is reported as unattributed Rooms/search traffic.
+          "x-cellect-llm-step": "qmdGenerate",
           ...(this.generateApiKey ? { Authorization: `Bearer ${this.generateApiKey}` } : {}),
         },
         body: JSON.stringify(body),
