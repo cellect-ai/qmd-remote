@@ -25,6 +25,16 @@ import type {
   LLMSessionOptions,
 } from "./llm.js";
 
+// A generated line with no text, or a lex line made only of -exclusions, has
+// nothing to search; Qdrant rejects such a lex query and would fail the whole
+// scoped query (Rooms security smoke, 2026-11-11). Tokens match
+// parseQdrantLexQuery in qdrant.ts.
+function isSearchableExpansion(q: Queryable): boolean {
+  if (q.type !== 'lex') return q.text.length > 0;
+  return (q.text.match(/-?"[^"]+"|-?\S+/g) ?? [])
+    .some(token => !token.startsWith("-") && token.replace(/^"|"$/g, "").trim().length > 0);
+}
+
 function sanitizeEmbeddingInput(text: string): string {
   let wellFormed = "";
   for (let index = 0; index < text.length; index++) {
@@ -519,13 +529,14 @@ Final Output:`;
         if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
         const text = line.slice(colonIdx + 1).trim();
         return { type: type as QueryType, text };
-      }).filter((q: Queryable | null): q is Queryable => q !== null);
+      }).filter((q: Queryable | null): q is Queryable => q !== null && isSearchableExpansion(q));
 
       // Filter out lex entries if not requested
-      if (!includeLexical) {
-        return queryables.filter(q => q.type !== 'lex');
-      }
-      return queryables;
+      const usable = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
+      if (usable.length > 0) return usable;
+      const fallback: Queryable[] = [{ type: 'vec', text: query }];
+      if (includeLexical) fallback.unshift({ type: 'lex', text: query });
+      return fallback;
     } catch (error) {
       console.error("Query expansion failed:", error);
       // Fallback to original query
