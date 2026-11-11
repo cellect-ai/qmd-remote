@@ -74,6 +74,38 @@ describe("RemoteLLM generation authorization", () => {
   });
 });
 
+describe("RemoteLLM query expansion", () => {
+  function expansion(text: string) {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ choices: [{ text }], model: "fast" })));
+    return new RemoteLLM({ generateUrl: "http://generate.test", generateModel: "fast" });
+  }
+
+  test("drops generated lexical lines that have no positive term", async () => {
+    const llm = expansion([
+      "hyde: An operating agreement for the project.",
+      "lex: -draft",
+      'lex: -"term sheet"',
+      "lex:",
+      'lex: operating agreement -draft',
+      "vec: ",
+      "vec: signed operating agreement",
+    ].join("\n"));
+    expect(await llm.expandQuery("operating agreement")).toEqual([
+      { type: "hyde", text: "An operating agreement for the project." },
+      { type: "lex", text: "operating agreement -draft" },
+      { type: "vec", text: "signed operating agreement" },
+    ]);
+  });
+
+  test("falls back to the original query when no generated line is searchable", async () => {
+    const llm = expansion("lex: -draft\nvec:");
+    expect(await llm.expandQuery("operating agreement")).toEqual([
+      { type: "lex", text: "operating agreement" },
+      { type: "vec", text: "operating agreement" },
+    ]);
+  });
+});
+
 describe("RemoteLLM embedding sanitization", () => {
   test("embeds both complete halves on context overflow and normalizes their pooled vector", async () => {
     const inputs: string[] = [];
