@@ -68,6 +68,8 @@ describe("RemoteLLM generation authorization", () => {
       const headers = new Headers(call[1]?.headers);
       expect(headers.get("authorization")).toBe("Bearer runtime-product-key");
     }
+    const generation = fetchMock.mock.calls.find(call => String(call[0]).endsWith("/v1/completions"));
+    expect(new Headers(generation?.[1]?.headers).get("x-cellect-llm-step")).toBe("qmdGenerate");
     expect(llm.getConfig()).not.toHaveProperty("generateApiKey");
   });
 });
